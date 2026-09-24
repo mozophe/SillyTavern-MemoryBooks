@@ -7,6 +7,11 @@ function cleanString(value) {
     return String(value || '').trim();
 }
 
+// crypto.randomUUID only exists in secure contexts (HTTPS/localhost); ST over plain-HTTP LAN lacks it.
+function newId() {
+    return crypto.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
 function uniqueStrings(values) {
     const result = [];
     const seen = new Set();
@@ -27,7 +32,7 @@ export function isNarratorModeActive({ isGroupChat = false, manualModeEnabled = 
     return !isGroupChat && manualModeEnabled === true && enabled === true;
 }
 
-export function createNarratorMember({ id, avatar, name, lorebookName }, createId = () => crypto.randomUUID()) {
+export function createNarratorMember({ id, avatar, name, lorebookName }, createId = newId) {
     return {
         id: cleanString(id) || cleanString(createId()),
         avatar: cleanString(avatar),
