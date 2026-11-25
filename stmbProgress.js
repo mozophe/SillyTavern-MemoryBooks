@@ -1,13 +1,15 @@
 // Copyright (C) 2024–2026 Aiko Hanasaki
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { eventSource, event_types, getRequestHeaders, saveSettings, isChatSaving, isGenerating } from '../../../../script.js';
+import { eventSource, event_types, getRequestHeaders, saveSettings, isChatSaving, isGenerating, selectCharacterById, openCharacterChat } from '../../../../script.js';
 import { sha256 } from '../../../../lib.js';
 import { extension_settings, getContext } from '../../../extensions.js';
 import { Popup, POPUP_TYPE, POPUP_RESULT } from '../../../popup.js';
 import { executeSlashCommands } from '../../../slash-commands.js';
+import { openGroupById, openGroupChat } from '../../../group-chats.js';
 import { escapeHtml } from '../../../utils.js';
 import { tr } from './i18nHelpers.js';
+import { PROGRESS_TIMEOUT_MS } from './constants.js';
 import { createPendingProgressController, progressFingerprint, progressSourceMessages } from './pendingProgress.js';
 
 let hooks = null;
@@ -16,6 +18,7 @@ let timer = null;
 let visit = 0;
 let promptedVisit = -1;
 let activePopup = null;
+let recovery = null;
 let initialized = false;
 const notified = new Set();
 const text = (name, fallback, params) => tr(`STMemoryBooks_Progress_${name}`, fallback, params);
@@ -49,7 +52,7 @@ async function readJson(url, body, signal) {
 
 async function persist(expected) {
     const controller = new AbortController();
-    const deadline = setTimeout(() => controller.abort(), 10000);
+    const deadline = setTimeout(() => controller.abort(), PROGRESS_TIMEOUT_MS);
     let listener;
     let rejectWait;
     const saved = new Promise((resolve, reject) => {
@@ -73,7 +76,7 @@ async function persist(expected) {
 
 async function readChat(ref) {
     const controller = new AbortController();
-    const deadline = setTimeout(() => controller.abort(), 10000);
+    const deadline = setTimeout(() => controller.abort(), PROGRESS_TIMEOUT_MS);
     try {
         return ref.type === 'group'
             ? await readJson('/api/chats/group/get', { id: ref.chatId || ref.fileName, with_metadata: true }, controller.signal)
@@ -100,7 +103,7 @@ const controller = createPendingProgressController({
         try {
             await Promise.race([
                 getContext().saveMetadata(),
-                new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('Progress save timed out')), 10000); }),
+                new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('Progress save timed out')), PROGRESS_TIMEOUT_MS); }),
             ]);
         } finally { clearTimeout(timeout); }
     },
@@ -159,8 +162,11 @@ export async function updateProgress(chatRef, end, options = {}) {
             toastr.error(text('PersistenceError', 'Memory saved, but its pending progress update could not be saved to settings. Retry before refreshing or the update may be lost.'), 'STMemoryBooks');
         } else if (!notified.has(chatKey)) {
             notified.add(chatKey);
-            toastr.info(text('Deferred', 'Memory saved. Reopen “{{chat}}” to finish updating its last-processed marker.', { chat: chatRef.fileName || chatRef.chatId }), 'STMemoryBooks');
+            toastr.info(text('Deferred', 'Memory saved. Progress for “{{chat}}” is pending. Safe updates apply when the chat is open and idle. Click to review.', { chat: chatRef.fileName || chatRef.chatId }), 'STMemoryBooks', {
+                onclick: () => { void showPendingProgress(); },
+            });
         }
+        promptedVisit = -1;
         schedulePrompt();
     }
     return result;
@@ -179,13 +185,54 @@ export function invalidatePendingProgress() {
 
 function schedulePrompt() {
     clearTimeout(timer);
-    timer = setTimeout(() => {
+    timer = setTimeout(async () => {
         const live = current();
         if (!live?.loaded || !hasPendingProgress(live.chatKey) || promptedVisit === visit) return;
-        if (live.busy || Popup.util.isPopupOpen()) { schedulePrompt(); return; }
+        if (live.busy || recovery || activePopup || Popup.util.isPopupOpen()) { schedulePrompt(); return; }
+        const attemptedVisit = visit;
         promptedVisit = visit;
-        void showPendingProgress(live.chatKey);
+        // Reuse the verified save path; never override edits or manual marker changes automatically.
+        const ids = controller.list().filter(record => record.chatKey === live.chatKey && !controller.check(record)).map(record => record.id);
+        if (ids.length) {
+            recovery = controller.apply(ids);
+            try {
+                const result = await recovery;
+                if (result.status === 'applied') hooks?.resolved?.(live.chatKey);
+            } catch (error) {
+                console.warn('STMB: Pending progress recovery failed', error);
+            } finally { recovery = null; }
+        }
+        if (visit !== attemptedVisit || current()?.chatKey !== live.chatKey) { schedulePrompt(); return; }
+        if (hasPendingProgress(live.chatKey)) void showPendingProgress(live.chatKey);
     }, 500);
+}
+
+async function reopenProgressChat(ref) {
+    const before = current();
+    if (!ref || before?.busy) return false;
+    const key = hooks.getChatKey(ref);
+    if (before?.loaded && before.chatKey === key) return true;
+    // Core open functions can create an empty chat for a missing file. Check existence first.
+    const saved = await readChat(ref);
+    if (!Array.isArray(saved) || saved.length < 2 || !saved[0]?.chat_metadata) return false;
+    if (current()?.busy || current()?.chatKey !== before?.chatKey || current()?.metadata !== before?.metadata) return false;
+    const context = getContext();
+    if (ref.type === 'character') {
+        const id = context.characters.findIndex(character => character.avatar === ref.avatarUrl);
+        if (id < 0 || !ref.fileName) return false;
+        await selectCharacterById(id, { switchMenu: false });
+        const selected = getContext();
+        if (current()?.busy || selected.groupId || selected.characters[selected.characterId]?.avatar !== ref.avatarUrl) return false;
+        if (hooks.getChatKey() !== key) await openCharacterChat(ref.fileName);
+    } else if (ref.type === 'group') {
+        const group = context.groups.find(group => String(group.id) === String(ref.groupId));
+        const chatId = ref.chatId || ref.fileName;
+        if (!group?.chats?.includes(chatId)) return false;
+        if (String(context.groupId) !== String(group.id)) await openGroupById(group.id);
+        if (current()?.busy || String(getContext().groupId) !== String(group.id)) return false;
+        if (hooks.getChatKey() !== key) await openGroupChat(group.id, chatId);
+    } else return false;
+    return current()?.loaded && current()?.chatKey === key;
 }
 
 export function progressChatLoaded() {
@@ -197,15 +244,19 @@ export function progressChatLoaded() {
     schedulePrompt();
 }
 
-export async function showPendingProgress(onlyChatKey = null) {
+export async function showPendingProgress(onlyChatKey = null, initialStatus = '') {
+    if (recovery) { try { await recovery; } catch { /* Keep failed records available for review. */ } }
     if (activePopup) return;
     const records = controller.list().filter(record => !onlyChatKey || !record.chatKey || record.chatKey === onlyChatKey);
     if (records.some(record => !record.chatKey || record.chatKey === current()?.chatKey)) promptedVisit = visit;
     const content = document.createElement('div');
+    const explanation = document.createElement('p');
+    explanation.textContent = text('Explanation', 'The last-processed marker tracks which messages are already covered by saved memories, so the next memory starts in the right place and automatic thresholds count new messages. Safe pending updates are applied automatically when their chat is open and idle. Saved memories remain intact while an update is pending.');
     const status = document.createElement('p');
     status.setAttribute('role', 'status');
+    status.textContent = initialStatus;
     const rows = document.createElement('div');
-    content.append(status, rows);
+    content.append(explanation, status, rows);
     let busy = false;
     const popup = new Popup(content, POPUP_TYPE.TEXT, '', {
         okButton: false, cancelButton: text('Later', 'Later'),
@@ -256,14 +307,31 @@ export async function showPendingProgress(onlyChatKey = null) {
         const target = Math.max(...group.map(record => Number.isInteger(record.end) ? record.end : -1));
         row.innerHTML = `<strong>${escapeHtml(name)}</strong><p>${escapeHtml(isCurrent
             ? text('Range', 'Current last-processed message: {{current}}. Pending progress through: {{target}}.', { current: Number.isFinite(highest) ? highest : '—', target })
-            : text('OpenChat', 'Open this chat manually to apply its pending update.'))}</p>`;
+            : text('ReopenInfo', 'Reopen this chat to update its marker through message {{target}}. This switches your active chat.', { target }))}</p>`;
         const ids = group.map(record => record.id);
+        if (!isCurrent && group[0].chatRef && ['character', 'group'].includes(group[0].chatRef.type)) {
+            const reopen = document.createElement('button');
+            reopen.className = 'menu_button';
+            reopen.textContent = text('Reopen', 'Reopen chat and update marker');
+            reopen.onclick = async () => {
+                await run(async () => {
+                    if (!await reopenProgressChat(group[0].chatRef)) return { status: 'pending' };
+                    return controller.apply(ids);
+                }, row);
+                // Rebuild controls for the newly active chat, including explicit Apply if validation failed.
+                if (current()?.chatKey === key && controller.list().length) {
+                    await popup.completeCancelled();
+                    await showPendingProgress(onlyChatKey, status.textContent);
+                }
+            };
+            row.append(reopen);
+        }
         if (isCurrent) {
             const apply = document.createElement('button');
             apply.className = 'menu_button';
             apply.textContent = tr('STMemoryBooks_Apply', 'Apply');
             apply.onclick = () => run(async () => {
-                const deadline = Date.now() + 10000;
+                const deadline = Date.now() + PROGRESS_TIMEOUT_MS;
                 while (current()?.busy) {
                     if (current()?.chatKey !== key || Date.now() >= deadline) return { status: 'pending' };
                     await new Promise(resolve => setTimeout(resolve, 250));

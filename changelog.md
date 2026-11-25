@@ -7,6 +7,62 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 ← [Back to README](readme.md)
 
+## v9.5.0 (November 25, 2026)
+- Memory Books now remembers profiles per chat. Added a consolidation connection override (including regeneration) and clarified Single/Multi default prompt selection.
+
+## v9.4.0 (November 4, 2026)
+- Added configurable timeout to constants.js.
+
+## v9.3.13 (November 1, 2026)
+- Rollback protection tweaks.
+
+## v9.3.12 (October 31, 2026)
+- Added sorting to prompt manager lists.
+
+## v9.3.11 (October 29, 2026)
+- Additional regex processing added to Topical Clips creation and/or updates manually and/or with Memory Assistance.
+
+## v9.3.10 (October 28, 2026)
+- Memory Assist now uses regex.
+
+## v9.3.9 (October 23, 2026)
+- Memory Assist manual trigger added: `/memory-assist x-y` (defaults to current scene if x-y is not specified)
+
+## v9.3.8 (October 16, 2026)
+- Topical Clips: hidden message checkbox, start/end auto-populate. 
+
+## v9.3.7 (October 12, 2026)
+- Combine Clip enhancements including format edits.
+
+## v9.3.6 (October 7, 2026)
+- Refactor pending actions popup.
+- Fix narrator cast stamping bug.
+
+## v9.3.5 (October 5, 2026)
+- Fix chat icon bound status bug.
+
+## v9.3.4 (October 3, 2026)
+- UI improvement for "Extract" function.
+- New feature: Combine Clips to combine multiple related STMB Clips into one. 
+
+## v9.3.3 (September 29, 2026)
+- Added memory reminders to ~~nag~~ remind you to make memories.
+
+## v9.3.2 (September 28, 2026)
+- Fixed: branch rollback now unhides retained messages from deleted memories after the Memory Books save successfully.
+
+## v9.3.1 (September 27, 2026)
+- Fix **Use ST's ChatCompletionService** to use the selected SillyTavern Connection Manager profile, including its credentials, provider, and preset, while retaining STMB's model and temperature overrides. Existing behavior is preserved when no connection profile is selected.
+- Stop retrying failed connection-profile requests through the direct request path, preserving the original provider error and avoiding duplicate requests after rate-limit failures.
+
+## v9.3.0 (September 23, 2026)
+- Add Side Prompt versioning.
+- Fix auto-rollback for branches and checkpoints.
+- Add Suggest mode to Memory Assistance for discovering Topical Clip topics without updating existing Clips.
+- Add Extract/Find to build Topical Clips from noncontiguous messages in the loaded chat, with checks for changed selections and messages.
+- Keep Topical Clip keywords in sync when switching the selected update target.
+- Add recoverable consolidation checkpoints with lorebook readback, safe retry handling, and review of uncertain saves after reload.
+
 ## v9.2.3 (September 16, 2026)
 - Fix Topical Clip keyword fill.
 

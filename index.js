@@ -1,6 +1,8 @@
 // Copyright (C) 2024–2026 Aiko Hanasaki
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { MEMORY_REMINDER_DEFAULTS, normalizeReminderInterval, createMemoryReminderController } from './memoryReminders.js';
+
 import {
   eventSource,
   event_types,
@@ -12,6 +14,7 @@ import {
   saveSettingsDebounced,
   characters,
   this_chid,
+  streamingProcessor,
   settings as st_settings,
 } from "../../../../script.js";
 import { Popup, POPUP_TYPE, POPUP_RESULT } from "../../../popup.js";
@@ -122,6 +125,7 @@ import {
   throwIfStmbStopped,
   withGoBackButton,
 } from "./utils.js";
+import { CONSOLIDATION_PROFILE_KEY, resolveProfileIndex, getChatProfileSelection, setChatProfileSelection } from "./profileSelection.js";
 import * as SummaryPromptManager from "./summaryPromptManager.js";
 import {
   CONSOLIDATION_REGENERATION_PRESET_KEY,
@@ -161,6 +165,7 @@ import {
   buildQueuedMemoryAssistanceJobs,
   executeQueuedMemoryAssistanceJob,
   runClipReviewAfterMemory,
+  runMemoryAssistanceCommand,
   showClipReviewSuggestionsPopup,
 } from "./clipReview.js";
 import { CLIP_REVIEW_METADATA_KEY, normalizeMemoryAssistanceMode } from "./clipReviewPolicy.js";
@@ -185,10 +190,18 @@ import {
 } from "./contextSettingsPopup.js";
 import {
   runSummaryAnalysisSequential,
-  commitSummaryEntries,
+  snapshotConsolidationProfile,
   formatSummaryTitle,
   parseSummaryJsonResponse,
 } from "./arcanalysis.js";
+import {
+  commitSummaryEntriesRecoverable as commitSummaryEntries,
+  dismissConsolidationCheckpoint,
+  getConsolidationCheckpoint,
+  getUnfinishedConsolidationCheckpoints,
+  markConsolidationPostEffectsDone,
+  resumeConsolidationCheckpointById,
+} from "./consolidationRecovery.js";
 import * as ArcPrompts from "./arcAnalysisPromptManager.js";
 import {
   MIN_SUMMARY_CHILDREN,
@@ -225,6 +238,7 @@ import {
   updateMemoryTierMacroCache,
 } from "./memoryTierMacros.js";
 import { summaryPromptsTableTemplate } from "./templatesSummaryPrompts.js";
+import { getPopupSort, mountTableSort, mountListSort, createViewSort } from "./viewSort.js";
 import {
   t as __st_t_tag,
   translate,
@@ -256,9 +270,14 @@ import {
   ROLLBACK_SCOPE_FULL,
   applyLorebookRollback,
   applySidePromptRestoration,
+  reconcileSidePromptHistoryStates,
   collectConsolidationRollbackPlan,
   collectRollbackMemories,
   computeRollbackCheckpoint,
+  getChildRollbackUnhideRanges,
+  getDeletedMessageRollbackUnhideRanges,
+  fingerprintRollbackChatPrefix,
+  isRollbackBaseMemory,
   createMessageDeletionTracker,
   fingerprintRollbackEntry,
   planSidePromptRestorations,
@@ -304,9 +323,13 @@ import {
   stampNarratorCast,
   validateNarratorBindings,
 } from "./narratorMode.js";
+import { createNarratorGenerationState } from "./narratorGenerationState.js";
 import "../../../../lib/select2.min.js";
 import { applyGroupMemoryPolicy, getGroupMemoryProfile, isCharacterAwarenessDisabled } from "./groupChatPolicy.js";
 import { setGroupSettingDisabled } from "./groupChatSettingsUi.js";
+
+const summaryPromptViewSort = createViewSort();
+const consolidationPromptViewSort = createViewSort();
 
 /**
  * Async effective prompt that respects Summary Prompt Manager overrides
@@ -344,6 +367,10 @@ async function getEffectivePromptAsync(profile, targetKind = "") {
     );
   }
   return getDefaultPrompt();
+}
+
+function getChatProfileIndex(settings) {
+  return resolveProfileIndex(settings, getSceneMarkers());
 }
 
 async function snapshotProfilePrompts(profile, context = getCurrentMemoryBooksContext()) {
@@ -579,6 +606,7 @@ const defaultSettings = {
     narratorCastDrawerPosition: null,
     narratorCastDrawerCollapsed: true,
     unhideBeforeMemory: false,
+    topicalClipIncludeHiddenMessages: false,
     refreshEditor: true,
     maxTokens: DEFAULT_MAX_TOKENS,
     tokenWarningThreshold: 50000,
@@ -588,6 +616,7 @@ const defaultSettings = {
     allowSceneOverlap: false,
     autoHideMode: "all",
     unhiddenEntriesCount: 2,
+    ...MEMORY_REMINDER_DEFAULTS,
     autoSummaryEnabled: false,
     autoSummaryInterval: 50,
     autoSummaryTriggerMode: 'messages',
@@ -601,13 +630,17 @@ const defaultSettings = {
     characterAwareMemories: true,
     useSeparateGroupSidePrompts: true,
     autoRollbackEnabled: false,
+    autoRollbackApplyToBranches: false,
     autoRollbackUpdateLastProcessed: true,
     autoRollbackDeleteLastMemory: true,
     autoRollbackRestorePreviousSidePrompts: true,
     lorebookNameTemplate: "LTM - {{char}} - {{chat}}",
     compactionPromptTemplate: "",
     topicalClipPromptTemplate: "",
-    topicalClipEntrySettings: { enabled: false, position: 0, orderMode: "auto", orderValue: 100, reverseStart: 9999 },
+    combineClipsPromptTemplate: "",
+    topicalClipFormat: "",
+    combinedClipFormat: "",
+    topicalClipEntrySettings: { enabled: false, position: 0, outletName: "", orderMode: "auto", orderValue: 100, reverseStart: 9999 },
     memoryAssistanceMode: "off",
     compactionProfileIndex: 0,
     useRegex: false,
@@ -615,6 +648,7 @@ const defaultSettings = {
     selectedRegexIncoming: [],
     defaultSoloSidePromptSetKey: "",
     defaultGroupSidePromptSetKey: "",
+    sidePromptVersioningEnabled: false,
     // Arc creation ordering (applies to newly created arcs)
     arcOrderMode: "auto",
     arcOrderValue: 100,
@@ -647,6 +681,8 @@ function getBranchLorebookController() {
   branchLorebookController = createBranchLorebookController({
     getCurrentChatId,
     getChatMessages: () => chat,
+    getMessageCount: () => chat?.length || 0,
+    getActiveLorebookNames: () => getCurrentChatLorebookNames(initializeSettings()),
     getChatMetadata: () => chat_metadata,
     getSettings: initializeSettings,
     isGroupChat: () => !!getCurrentMemoryBooksContext()?.isGroupChat,
@@ -694,6 +730,7 @@ function getBranchLorebookController() {
     },
     clearNotification: notification => toastr.clear(notification),
     afterSuccess: () => eventSource.emit(MEMORY_TIER_CACHE_REFRESH_EVENT),
+    afterChildReady: ({ chatId, boundary }) => { void executeChildChatAutoRollback({ chatId, boundary }); },
     logger: console,
   });
   return branchLorebookController;
@@ -717,11 +754,12 @@ let memoryBoundaryButtonDragState = null;
 let narratorCastDrawer = null;
 let narratorCastDrawerDragState = null;
 let narratorGenerationSnapshot = null;
-let narratorGenerationType = null;
+const narratorResponseGeneration = createNarratorGenerationState();
 let manualGroupGenerationSnapshot = null;
 let lorebookRegenerationObserver = null;
 const memoryRollbackDeletionTracker = createMessageDeletionTracker();
 const memoryRollbackChains = new Map();
+const childMemoryRollbackInFlight = new Set();
 let lorebookRegenerationRefreshTimer = null;
 
 function normalizeMemoryBoundaryMode(mode) {
@@ -1040,7 +1078,7 @@ async function editNarratorCastMember(member, config, canonicalLorebookName) {
   return true;
 }
 
-async function showNarratorCastManager() {
+async function showNarratorCastManager(sortState = createViewSort()) {
   const config = getCurrentNarratorConfig();
   const canonical = getCurrentCanonicalLorebookName();
   const bookOptions = (world_names || []).map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("");
@@ -1048,13 +1086,20 @@ async function showNarratorCastManager() {
   const content = DOMPurify.sanitize(`<h3>${escapeHtml(translate("Narrator Cast", "STMemoryBooks_NarratorCast"))}</h3><p class="opacity50p">${escapeHtml(translate("Each declared character must use a unique Memory Book separate from the omniscient book.", "STMemoryBooks_NarratorCastDesc"))}</p><div class="stmb-narrator-manager-add"><input id="stmb-narrator-character-name" class="text_pole" type="text" placeholder="${escapeHtml(translate("Character name", "STMemoryBooks_CharacterName"))}"><select id="stmb-narrator-book" class="text_pole"><option value="">${escapeHtml(translate("Select Memory Book", "STMemoryBooks_SelectMemoryBook"))}</option>${bookOptions}</select><button type="button" id="stmb-narrator-add" class="menu_button">${escapeHtml(translate("Add", "STMemoryBooks_Add"))}</button></div><div class="stmb-narrator-manager-list">${rows || `<small class="opacity50p">${escapeHtml(translate("No cast members declared.", "STMemoryBooks_NoNarratorCast"))}</small>`}</div>`);
   const popup = new Popup(content, POPUP_TYPE.TEXT, "", { wide: true, cancelButton: translate("Close", "STMemoryBooks_Close"), okButton: false });
   markStmbPopup(popup);
+  mountListSort(popup.dlg?.querySelector('.stmb-narrator-manager-list'), sortState, {
+    character: translate('Character name', 'STMemoryBooks_CharacterName'),
+    book: translate('Memory Book', 'STMemoryBooks_Compaction_MemoryBook'),
+  }, {
+    character: row => row.children[0]?.textContent.trim(),
+    book: row => row.children[1]?.textContent.trim(),
+  }, ':scope > .stmb-narrator-manager-row');
   popup.dlg.addEventListener("click", async event => {
     const editButton = event.target.closest("[data-edit-narrator-member]");
     if (editButton) {
       const member = config.members.find(item => item.id === editButton.dataset.editNarratorMember);
       if (member && await editNarratorCastMember(member, config, canonical)) {
         await popup.complete(POPUP_RESULT.CANCELLED);
-        await showNarratorCastManager();
+        await showNarratorCastManager(sortState);
         refreshNarratorCastDrawer();
       }
       return;
@@ -1067,7 +1112,7 @@ async function showNarratorCastManager() {
         setNarratorActiveCast(config, config.activeCastIds);
         saveMetadataForCurrentContext();
         await popup.complete(POPUP_RESULT.CANCELLED);
-        await showNarratorCastManager();
+        await showNarratorCastManager(sortState);
         refreshNarratorCastDrawer();
       }
       return;
@@ -1083,7 +1128,7 @@ async function showNarratorCastManager() {
     config.members.push(candidate);
     saveMetadataForCurrentContext();
     await popup.complete(POPUP_RESULT.CANCELLED);
-    await showNarratorCastManager();
+    await showNarratorCastManager(sortState);
     refreshNarratorCastDrawer();
   });
   await popup.show();
@@ -1225,7 +1270,35 @@ function refreshMemoryBoundaryButton() {
   memoryBoundaryButton.style.display = "inline-flex";
 }
 
+let memoryReminderController;
+function getMemoryReminderController() {
+  return memoryReminderController ??= createMemoryReminderController({
+    current: () => ({
+      chatKey: getStmbChatKey(),
+      markers: getSceneMarkers(),
+      count: chat.length,
+      settings: extension_settings[MODULE_NAME]?.moduleSettings || {},
+      busy: isMemoryProcessing() || hasPendingProgress(),
+    }),
+    save: () => saveMetadataForCurrentContext(),
+    clear: toast => {
+      toast.stop(true, true);
+      toastr.clear(toast, { force: true });
+      // toastr.clear uses the global animation duration, not this toast's override.
+      toast.stop(true, true);
+    },
+    show: (mode, count, onHidden) => toastr.info(
+      mode === 'automatic'
+        ? tr('STMemoryBooks_Reminder_AutomaticToast', 'Automatic memory summaries are overdue: {{count}} unprocessed messages. Check your automatic memory settings or create a memory.', { count })
+        : tr('STMemoryBooks_Reminder_ManualToast', 'You have {{count}} messages since your last memory summary. Consider creating a memory.', { count }),
+      'STMemoryBooks',
+      { timeOut: 0, extendedTimeOut: 0, closeButton: true, tapToDismiss: false, hideDuration: 0, closeDuration: 0, preventDuplicates: false, onHidden },
+    ),
+  });
+}
+
 function refreshMemoryBoundaryUi() {
+  getMemoryReminderController().check();
   refreshMemoryBoundaryDivider();
   refreshMemoryBoundaryButton();
 }
@@ -1403,7 +1476,7 @@ async function maybePromptContextSettingForChatOpen() {
       return;
     }
     const settings = initializeSettings();
-    const profile = settings.profiles?.[settings.defaultProfile] || null;
+    const profile = settings.profiles?.[getChatProfileIndex(settings)] || null;
     if (!profile) return;
     await maybePromptForMigratedContextSetting(profile, { blocking: false });
     lastContextPromptChatKey = chatKey;
@@ -1417,6 +1490,7 @@ async function maybePromptContextSettingForChatOpen() {
 }
 
 async function handleChatChanged(chatId) {
+  getMemoryReminderController().dismiss();
   progressChatLoaded();
   await getBranchLorebookController().handleChatChanged(chatId);
   console.log(
@@ -1435,12 +1509,18 @@ async function handleChatChanged(chatId) {
     );
   }
   hideFloatingClipButton();
+  narratorGenerationSnapshot = null;
+  narratorResponseGeneration.clear();
+  manualGroupGenerationSnapshot = null;
+  refreshNarratorCastDrawer();
   refreshMemoryBoundaryUi();
   updateSceneStateCache();
   validateAndCleanupSceneMarkers();
   memoryRollbackDeletionTracker.snapshot(getStmbChatKey(), chat);
+  queueDeletedMessageRollbackUnhideRecovery(getStmbChatKey(), getMemoryRollbackChatId());
   void refreshMemoryTierMacroCache();
   void maybePromptContextSettingForChatOpen();
+  await refreshPopupContent();
 
   setTimeout(() => {
     try {
@@ -1485,10 +1565,12 @@ function validateAndCleanupSceneMarkers() {
 }
 
 async function handleMessageReceived() {
+  const reminderChatKey = getStmbChatKey();
   try {
     setTimeout(validateSceneMarkers, SCENE_MANAGEMENT.VALIDATION_DELAY_MS);
     setTimeout(refreshMemoryBoundaryUi, SCENE_MANAGEMENT.VALIDATION_DELAY_MS);
     await handleAutoSummaryMessageReceived();
+    if (getStmbChatKey() === reminderChatKey) getMemoryReminderController().check({ notify: true });
     await evaluateTrackers();
   } catch (error) {
     console.error(
@@ -1507,7 +1589,11 @@ function handleStmbJobStateChanged() {
   if (hasActiveStmbJobs(getStmbChatKey())) return;
 
   autoSummaryJobRetryInFlight = true;
+  const reminderChatKey = getStmbChatKey();
   retryAutoSummaryAfterJobIdle()
+    .then(() => {
+      if (getStmbChatKey() === reminderChatKey) getMemoryReminderController().check({ notify: true });
+    })
     .catch((error) => {
       console.warn("STMemoryBooks: auto-summary retry after job idle failed:", error);
     })
@@ -2535,6 +2621,7 @@ function validateSettings(settings) {
   }
 
   normalizeDefaultSidePromptSetKeys(settings.moduleSettings);
+  settings.moduleSettings.sidePromptVersioningEnabled = settings.moduleSettings.sidePromptVersioningEnabled === true;
 
   // Validate maxTokens and fall back to the app default when unset or invalid.
   // A value of 0 is intentional: it means "inherit SillyTavern's Chat Completion setting".
@@ -2562,6 +2649,11 @@ function validateSettings(settings) {
   }
 
   // Validate auto-summary settings
+  for (const [key, fallback] of Object.entries(MEMORY_REMINDER_DEFAULTS)) {
+    settings.moduleSettings[key] = typeof fallback === 'boolean'
+      ? settings.moduleSettings[key] === true
+      : normalizeReminderInterval(settings.moduleSettings[key], fallback);
+  }
   if (settings.moduleSettings.autoSummaryEnabled === undefined) {
     settings.moduleSettings.autoSummaryEnabled = false;
   }
@@ -2638,6 +2730,10 @@ function validateSettings(settings) {
     settings.moduleSettings.autoRollbackEnabled = false;
     autoRollbackSettingsMigrated = true;
   }
+  if (typeof settings.moduleSettings.autoRollbackApplyToBranches !== "boolean") {
+    settings.moduleSettings.autoRollbackApplyToBranches = false;
+    autoRollbackSettingsMigrated = true;
+  }
   for (const key of [
     "autoRollbackUpdateLastProcessed",
     "autoRollbackDeleteLastMemory",
@@ -2653,6 +2749,9 @@ function validateSettings(settings) {
   // Validate unhide-before-memory setting (defaults to false)
   if (settings.moduleSettings.unhideBeforeMemory === undefined) {
     settings.moduleSettings.unhideBeforeMemory = false;
+  }
+  if (settings.moduleSettings.topicalClipIncludeHiddenMessages === undefined) {
+    settings.moduleSettings.topicalClipIncludeHiddenMessages = false;
   }
 
   // Validate lorebook name template
@@ -4021,7 +4120,7 @@ async function showAndGetMemorySettings(
     const profileIndex =
       selectedProfileIndex !== null
         ? selectedProfileIndex
-        : settings.defaultProfile;
+        : getChatProfileIndex(settings);
 
     // Show simplified confirmation popup with selected profile
     confirmationResult = await showConfirmationPopup(
@@ -4042,8 +4141,8 @@ async function showAndGetMemorySettings(
     const profileIndex =
       selectedProfileIndex !== null
         ? selectedProfileIndex
-        : settings.defaultProfile;
-    const selectedProfile = settings.profiles[profileIndex] || settings.profiles[settings.defaultProfile];
+        : getChatProfileIndex(settings);
+    const selectedProfile = settings.profiles[profileIndex] || settings.profiles[getChatProfileIndex(settings)];
     confirmationResult = {
       confirmed: true,
       profileSettings: {
@@ -4653,13 +4752,8 @@ async function prepareConsolidationRegenerationDraft(lorebookData, eligibility, 
     sources.map(source => [String(source.uid), fingerprintRegenerationEntry(source)]),
   );
   const analysisOptions = buildConsolidationRegenerationOptions(sources.length, eligibility.tier);
-  let profileSettings = null;
+  const profileSettings = snapshotConsolidationProfile();
   if (options.snapshotProfile) {
-    const settings = initializeSettings();
-    profileSettings = await snapshotProfilePrompts(
-      settings.profiles?.[settings.defaultProfile] || null,
-      options.memoryBooksContext,
-    );
     analysisOptions.promptText = await ArcPrompts.getPrompt(
       CONSOLIDATION_REGENERATION_PRESET_KEY,
     );
@@ -4986,6 +5080,7 @@ async function executeQueuedLorebookRegenerationJob(job, jobContext) {
 }
 
 async function handleLorebookEntryRegeneration(button) {
+  const reminderChatKey = getStmbChatKey();
   const memoryBooksContext = getCurrentMemoryBooksContext();
   if (isProcessingMemory || isProcessingArc) {
     toastr.warning(
@@ -5210,6 +5305,7 @@ async function handleLorebookEntryRegeneration(button) {
     isProcessingMemory = false;
     isProcessingArc = false;
     task.finish();
+    if (getStmbChatKey() === reminderChatKey) getMemoryReminderController().check({ notify: true });
     button.disabled = false;
     if (buttonLabel) {
       buttonLabel.textContent = entryKind === "sidePrompt"
@@ -6540,6 +6636,7 @@ async function runConsolidationPreviewWorkflow({
   commitCandidates,
   throwIfCancelled = null,
 }) {
+  const consolidationRunId = globalThis.crypto?.randomUUID?.() || `stmb-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const originalEntries = Array.isArray(selectedEntries) ? selectedEntries : [];
   const pendingIds = new Set(
     originalEntries
@@ -6602,7 +6699,7 @@ async function runConsolidationPreviewWorkflow({
       ? previewResult.acceptedCandidates
       : [];
     if (acceptedCandidates.length > 0) {
-      const commitResult = await commitCandidates(acceptedCandidates);
+      const commitResult = await commitCandidates(acceptedCandidates, consolidationRunId);
       const results = Array.isArray(commitResult?.results) ? commitResult.results : [];
       committedResults.push(...results);
       committedCandidates.push(...acceptedCandidates);
@@ -6628,6 +6725,27 @@ async function runConsolidationPreviewWorkflow({
 async function executeQueuedConsolidationJob(job, jobContext) {
   const payload = job?.payload || {};
   const lorebookName = String(payload.lorebookName || job.lorebookName || "").trim();
+  const checkpointIds = Array.isArray(payload.consolidationCheckpointIds) ? payload.consolidationCheckpointIds : [];
+  if (checkpointIds.length > 0) {
+    const results = [];
+    for (const id of checkpointIds) results.push(await resumeConsolidationCheckpointById(id));
+    const consumed = new Set(checkpointIds.flatMap(id => getConsolidationCheckpoint(id)?.candidate?.memberIds || []).map(String));
+    const leftovers = (payload.selectedEntries || []).map(getEntryUid).filter(id => id !== null && !consumed.has(String(id)));
+    jobContext.setResult({ lorebookName, targetTier: Number(payload.targetTier), created: results.length,
+      recovered: true, leftovers: leftovers.length });
+    if (leftovers.length) jobContext.setDetail(translate(
+      'Saved summaries recovered. Start a new consolidation for the remaining sources.',
+      'STMemoryBooks_Consolidation_RecoveryPartial'));
+    await runPostConsolidationCommitFlow({ created: results.length, targetTier: Number(payload.targetTier),
+      lorebookName, lorebookData: await loadWorldInfo(lorebookName), chatRef: job.chatRef });
+    return;
+  }
+  if (payload.consolidationSaveAttempted) {
+    throw new Error(translate(
+      "This consolidation has no save receipt. Review saved summaries in the Memory Book before starting a new consolidation.",
+      "STMemoryBooks_Consolidation_RetryNeedsReview",
+    ));
+  }
   const targetTier = clampInt(Number(payload.targetTier), 1, 6);
   const selectedEntries = Array.isArray(payload.selectedEntries) ? payload.selectedEntries : [];
   if (!lorebookName || selectedEntries.length === 0) {
@@ -6694,7 +6812,7 @@ async function executeQueuedConsolidationJob(job, jobContext) {
                 payload.profileSettings || null,
               );
             },
-            commitCandidates: async (candidates) => {
+            commitCandidates: async (candidates, consolidationRunId) => {
               jobContext.setState("saving", { detail: lorebookName });
               let result = null;
               await withStmbWriteLane({ type: "lorebook", name: lorebookName }, async () => {
@@ -6708,6 +6826,13 @@ async function executeQueuedConsolidationJob(job, jobContext) {
                   collectSummaryMemberIds(candidates),
                 );
                 result = await commitSummaryEntries({
+                  profileOrConnection: payload.profileSettings || null,
+                  consolidationRunId,
+                  chatRef: job.chatRef,
+                  onCheckpoint: id => jobContext.patch({ payload: {
+                    ...jobContext.job.payload,
+                    consolidationCheckpointIds: [...(jobContext.job.payload.consolidationCheckpointIds || []), id],
+                  } }),
                   lorebookName,
                   lorebookData: freshLorebook,
                   summaryCandidates: candidates,
@@ -6771,6 +6896,13 @@ async function executeQueuedConsolidationJob(job, jobContext) {
     }
     verifyConsolidationSourceFingerprints(freshLorebook, payload.sourceFingerprints || {});
     const result = await commitSummaryEntries({
+      profileOrConnection: payload.profileSettings || null,
+      consolidationRunId: job.id,
+      chatRef: job.chatRef,
+      onCheckpoint: id => jobContext.patch({ payload: {
+        ...jobContext.job.payload,
+        consolidationCheckpointIds: [...(jobContext.job.payload.consolidationCheckpointIds || []), id],
+      } }),
       lorebookName,
       lorebookData: freshLorebook,
       summaryCandidates,
@@ -6800,7 +6932,78 @@ async function executeQueuedConsolidationJob(job, jobContext) {
   });
 }
 
+async function showConsolidationRecoveryPopup() {
+  const checkpoints = getUnfinishedConsolidationCheckpoints();
+  if (checkpoints.length === 0) {
+    toastr.info(translate("No pending consolidation saves.", "STMemoryBooks_Consolidation_NoPending"), "STMemoryBooks");
+    return;
+  }
+  const rows = checkpoints.map(item => `<div class="info_block marginBot5" data-checkpoint-id="${escapeHtml(item.id)}">
+    <strong>${escapeHtml(item.lorebookName)}</strong> · ${escapeHtml(item.status === 'needsReview'
+      ? translate('Needs Review', 'STMemoryBooks_Jobs_NeedsReview')
+      : translate('Pending', 'STMemoryBooks_Consolidation_Pending'))}
+    <p>${escapeHtml(item.status === 'needsReview'
+      ? translate('Saved consolidation state could not be confirmed. Review the Memory Book before starting again.', 'STMemoryBooks_Consolidation_ReviewRequired')
+      : translate('Check the saved summary before resuming.', 'STMemoryBooks_Consolidation_RecoveryHint'))}</p>
+    <button type="button" class="menu_button stmb-review-consolidation">${escapeHtml(translate('Review details', 'STMemoryBooks_Consolidation_ReviewAction'))}</button>
+    ${item.status === 'needsReview' ? `<button type="button" class="menu_button stmb-dismiss-consolidation">${escapeHtml(translate('Dismiss after review', 'STMemoryBooks_Consolidation_DismissAction'))}</button>` : ''}
+    ${item.status === 'needsReview' ? '' : `<button type="button" class="menu_button stmb-resume-consolidation">${escapeHtml(translate('Resume', 'STMemoryBooks_Consolidation_Resume'))}</button>`}
+  </div>`).join('');
+  const popup = new Popup(DOMPurify.sanitize(`<h3>${escapeHtml(translate('Consolidation recovery', 'STMemoryBooks_Consolidation_RecoveryTitle'))}</h3><div id="stmb-recovery-list">${rows}</div>`),
+    POPUP_TYPE.TEXT, '', { wide: true, large: true, allowVerticalScrolling: true, okButton: false,
+      cancelButton: translate('Close', 'STMemoryBooks_Close') });
+  markStmbPopup(popup);
+  const shown = popup.show();
+  const recoveryList = popup.dlg?.querySelector('#stmb-recovery-list');
+  mountListSort(recoveryList, getPopupSort(popup), {
+    book: translate('Memory Book', 'STMemoryBooks_Compaction_MemoryBook'),
+  }, { book: row => row.querySelector('strong')?.textContent.trim() }, ':scope > [data-checkpoint-id]');
+  popup.dlg?.addEventListener('click', async event => {
+    const row = event.target.closest('[data-checkpoint-id]');
+    if (!row) return;
+    const checkpoint = checkpoints.find(item => item.id === row.dataset.checkpointId);
+    if (event.target.closest('.stmb-review-consolidation')) {
+      const details = new Popup(DOMPurify.sanitize(`<h3>${escapeHtml(checkpoint.lorebookName)}</h3>
+        <p>${escapeHtml(checkpoint.candidate.STMB_commitTitle || checkpoint.candidate.title || '')}</p>
+        <p>${escapeHtml((checkpoint.sources || []).map(source => source.uid).join(', '))}</p>
+        <p>${escapeHtml(checkpoint.error || '')}</p>`), POPUP_TYPE.TEXT, '', {
+        okButton: false, cancelButton: translate('Close', 'STMemoryBooks_Close') });
+      markStmbPopup(details);
+      await details.show();
+      return;
+    }
+    if (event.target.closest('.stmb-dismiss-consolidation')) {
+      await dismissConsolidationCheckpoint(row.dataset.checkpointId);
+      row.remove();
+      return;
+    }
+    const button = event.target.closest('.stmb-resume-consolidation');
+    if (!button) return;
+    button.disabled = true;
+    try {
+      await resumeConsolidationCheckpointById(row.dataset.checkpointId);
+      if (checkpoint && !checkpoint.postEffectsDone) {
+        if (checkpoint.chatKey === getStmbChatKey()) {
+          await runPostConsolidationCommitFlow({ created: 1, targetTier: checkpoint.options.targetTier,
+            lorebookName: checkpoint.lorebookName, lorebookData: await loadWorldInfo(checkpoint.lorebookName) });
+        } else {
+          await markConsolidationPostEffectsDone(checkpoint.lorebookName, checkpoint.options.targetTier, checkpoint.chatKey);
+        }
+      }
+      row.remove();
+      toastr.success(translate('Consolidation save confirmed.', 'STMemoryBooks_Consolidation_Confirmed'), 'STMemoryBooks');
+    } catch (error) {
+      const message = row.querySelector('p');
+      if (message) message.textContent = error?.code === 'STMB_CONSOLIDATION_NEEDS_REVIEW'
+        ? translate('Saved consolidation state could not be confirmed. Review the Memory Book before starting again.', 'STMemoryBooks_Consolidation_ReviewRequired')
+        : error.message;
+    } finally { button.disabled = false; }
+  });
+  await shown;
+}
+
 async function initiateMemoryCreation(selectedProfileIndex = null) {
+  const reminderChatKey = getStmbChatKey();
   if (guardPendingProgress()) return false;
   // Early validation checks (no flag set yet) - GROUP CHAT COMPATIBLE
   const context = getCurrentMemoryBooksContext();
@@ -7014,6 +7217,7 @@ async function initiateMemoryCreation(selectedProfileIndex = null) {
   } finally {
     // ALWAYS reset the flag, no matter how we exit
     isProcessingMemory = false;
+    if (getStmbChatKey() === reminderChatKey) getMemoryReminderController().check({ notify: true });
   }
 }
 
@@ -7593,7 +7797,7 @@ function populateInlineButtons() {
         );
         if (!profileSelect) return;
 
-        const selectedIndex = clampInt(readIntInput(profileSelect, settings.defaultProfile ?? 0), 0, settings.profiles.length - 1);
+        const selectedIndex = clampInt(readIntInput(profileSelect, getChatProfileIndex(settings)), 0, settings.profiles.length - 1);
         if (selectedIndex === settings.defaultProfile) {
           return;
         }
@@ -7623,7 +7827,7 @@ function populateInlineButtons() {
           );
           if (!profileSelect) return;
 
-          const selectedIndex = clampInt(readIntInput(profileSelect, settings.defaultProfile ?? 0), 0, settings.profiles.length - 1);
+          const selectedIndex = clampInt(readIntInput(profileSelect, getChatProfileIndex(settings)), 0, settings.profiles.length - 1);
           const selectedProfile = settings.profiles[selectedIndex];
 
           // Migrate legacy dynamic flag to provider-based current_st and allow editing of non-connection fields
@@ -7675,7 +7879,7 @@ function populateInlineButtons() {
           );
           if (!profileSelect) return;
 
-          const selectedIndex = readIntInput(profileSelect, settings.defaultProfile ?? 0);
+          const selectedIndex = readIntInput(profileSelect, getChatProfileIndex(settings));
           await deleteProfile(settings, selectedIndex, refreshPopupContent);
         } catch (error) {
           console.error(`${MODULE_NAME}: Error in delete profile:`, error);
@@ -7868,6 +8072,11 @@ function populateInlineButtons() {
       },
     },
     {
+      text: "🛠 " + translate("Consolidation recovery", "STMemoryBooks_Consolidation_RecoveryTitle"),
+      id: "stmb-consolidation-recovery",
+      action: showConsolidationRecoveryPopup,
+    },
+    {
       text: "🧭 " + translate("Memory Assistance Suggestions", "STMemoryBooks_ClipReview_SuggestionsTitle"),
       id: "stmb-clip-review-suggestions",
       action: async () => {
@@ -7990,9 +8199,12 @@ async function showPromptManagerPopup() {
       listEl.innerHTML = DOMPurify.sanitize(
         summaryPromptsTableTemplate({ items }),
       );
+      mountTableSort(listEl.querySelector('table'), summaryPromptViewSort, ['name'], {
+        name: row => row.querySelector('.stmb-preset-name')?.textContent.trim(),
+      });
     }
 
-    await popup.show();
+    if (await popup.show() !== POPUP_RESULT.AFFIRMATIVE) summaryPromptViewSort.reset();
   } catch (error) {
     console.error("STMemoryBooks: Error showing prompt manager:", error);
     toastr.error(
@@ -8199,13 +8411,13 @@ function setupPromptManagerEventHandlers(popup) {
     }
 
     // Determine selected profile index from the main settings popup if available
-    let selectedIndex = settings.defaultProfile ?? 0;
+    let selectedIndex = getChatProfileIndex(settings);
     if (currentPopupInstance?.dlg) {
       const profileSelect = currentPopupInstance.dlg.querySelector(
         "#stmb-profile-select",
       );
       if (profileSelect) {
-        selectedIndex = readIntInput(profileSelect, settings.defaultProfile ?? 0);
+        selectedIndex = readIntInput(profileSelect, getChatProfileIndex(settings));
       }
     }
 
@@ -8589,7 +8801,7 @@ async function showArcPromptManagerPopup() {
     content += "</div>";
 
     content += '<div class="world_entry_form_control">';
-    content += `<label for="stmb-apm-default"><strong>${escapeHtml(translate("Set Default", "STMemoryBooks_ArcPromptManager_SetDefault"))}:</strong> `;
+    content += `<label for="stmb-apm-default"><strong>${escapeHtml(translate("Default consolidation prompt", "STMemoryBooks_Consolidation_DefaultPrompt"))}:</strong> `;
     content += '<select id="stmb-apm-default" class="text_pole">';
     for (const p of presets.filter(
       (preset) => !preset.regenerationOnly && !preset.groupChatOnly,
@@ -8600,6 +8812,24 @@ async function showArcPromptManagerPopup() {
       content += `<option value="${escapeHtml(key)}"${selected}>${escapeHtml(name)}</option>`;
     }
     content += "</select></label></div>";
+    content += `<p class="opacity50p">${escapeHtml(translate("Choose Single or Multi to set the initial prompt for future consolidation dialogs. You can change it for each run.", "STMemoryBooks_Consolidation_DefaultPromptHelp"))}</p>`;
+
+    const overrideKey = settings.moduleSettings?.[CONSOLIDATION_PROFILE_KEY] || "";
+    content += '<div class="world_entry_form_control">';
+    content += `<label for="stmb-apm-profile"><strong>${escapeHtml(translate("Consolidation connection profile", "STMemoryBooks_Consolidation_ConnectionProfile"))}</strong></label>`;
+    content += '<select id="stmb-apm-profile" class="text_pole">';
+    content += `<option value="" ${overrideKey ? "" : "selected"}>${escapeHtml(translate("Use chat/default profile", "STMemoryBooks_Consolidation_UseChatProfile"))}</option>`;
+    if (overrideKey && !settings.profiles.some(profile => profile.profileKey === overrideKey)) {
+      content += `<option value="${escapeHtml(overrideKey)}" selected>${escapeHtml(translate("Missing profile — using the default", "STMemoryBooks_Profile_MissingFallback"))}</option>`;
+    }
+    for (const profile of settings.profiles) {
+      const name = profile.isBuiltinCurrentST
+        ? translate("Current SillyTavern Settings", "STMemoryBooks_Profile_CurrentST")
+        : profile.name;
+      content += `<option value="${escapeHtml(profile.profileKey)}" ${profile.profileKey === overrideKey ? "selected" : ""}>${escapeHtml(name)}</option>`;
+    }
+    content += '</select></div>';
+    content += `<p class="opacity50p">${escapeHtml(translate("Applies to all consolidation prompts and consolidated-summary regeneration. Overrides the chat profile connection.", "STMemoryBooks_Consolidation_ConnectionProfileHelp"))}</p>`;
 
     // Search/filter box
     content += '<div class="world_entry_form_control">';
@@ -8661,9 +8891,12 @@ async function showArcPromptManagerPopup() {
       listEl.innerHTML = DOMPurify.sanitize(
         summaryPromptsTableTemplate({ items }),
       );
+      mountTableSort(listEl.querySelector('table'), consolidationPromptViewSort, ['name'], {
+        name: row => row.querySelector('.stmb-preset-name')?.textContent.trim(),
+      });
     }
 
-    await popup.show();
+    if (await popup.show() !== POPUP_RESULT.AFFIRMATIVE) consolidationPromptViewSort.reset();
   } catch (error) {
     console.error(
       "STMemoryBooks: Error showing Consolidation Prompt Manager:",
@@ -8739,6 +8972,15 @@ function setupArcPromptManagerEventHandlers(popup) {
         .textContent.toLowerCase();
       row.style.display = displayName.includes(term) ? "" : "none";
     });
+  });
+
+  dlg.querySelector("#stmb-apm-profile")?.addEventListener("change", (e) => {
+    const settings = initializeSettings();
+    const key = String(e.target.value || "");
+    if (key && !settings.profiles.some(profile => profile.profileKey === key)) return;
+    if (key) settings.moduleSettings[CONSOLIDATION_PROFILE_KEY] = key;
+    else delete settings.moduleSettings[CONSOLIDATION_PROFILE_KEY];
+    saveSettingsDebounced();
   });
 
   dlg.querySelector("#stmb-apm-default")?.addEventListener("change", async (e) => {
@@ -9316,7 +9558,10 @@ async function runPostConsolidationCommitFlow({
   chatRef = null,
 } = {}) {
   if (Number(created || 0) <= 0) return;
-  if (chatRef && !isStmbJobChatCurrent(chatRef)) return;
+  if (chatRef && !isStmbJobChatCurrent(chatRef)) {
+    await markConsolidationPostEffectsDone(lorebookName, targetTier, getStmbChatKey(chatRef));
+    return;
+  }
 
   const normalizedTargetTier = clampInt(Number(targetTier), 1, 6);
   clearAutoConsolidationPromptState(normalizedTargetTier);
@@ -9330,6 +9575,7 @@ async function runPostConsolidationCommitFlow({
       },
     });
   }
+  await markConsolidationPostEffectsDone(lorebookName, normalizedTargetTier, getStmbChatKey(chatRef));
 }
 
 /**
@@ -10021,6 +10267,7 @@ async function showSummaryConsolidationPopup(popupOptions = {}) {
       return;
     }
 
+    const consolidationProfile = snapshotConsolidationProfile();
     const presetKey = String(
       dlg.querySelector("#stmb-arc-preset")?.value || defaultPresetKey,
     );
@@ -10189,12 +10436,7 @@ async function showSummaryConsolidationPopup(popupOptions = {}) {
 
     if (areStmbJobsEnabled()) {
       const chatRef = getCurrentStmbChatRef();
-      const profileSettings = await snapshotProfilePrompts(settings.profiles?.[settings.defaultProfile] || null, memoryBooksContext);
-      if (profileSettings) {
-        profileSettings.effectiveConnection = profileSettings.connection
-          ? { ...profileSettings.connection }
-          : profileSettings.effectiveConnection;
-      }
+      const profileSettings = consolidationProfile;
       for (const workItem of consolidationWorkItems) {
         const analysisOptions = workItem.analysisOptions || primaryAnalysisOptions;
         enqueueStmbJob({
@@ -10251,7 +10493,7 @@ async function showSummaryConsolidationPopup(popupOptions = {}) {
           itemAnalysis = await runSummaryAnalysisSequential(
             workItem.selectedEntries,
             workItem.analysisOptions,
-            null,
+            consolidationProfile,
           );
         } catch (e) {
           if (isStmbStopError(e)) return;
@@ -10274,6 +10516,7 @@ async function showSummaryConsolidationPopup(popupOptions = {}) {
             }
             verifyConsolidationSourceFingerprints(freshLorebook, workItem.sourceFingerprints || {});
             result = await commitSummaryEntries({
+              profileOrConnection: consolidationProfile,
               lorebookName: workItem.lorebookName,
               lorebookData: freshLorebook,
               summaryCandidates: itemCandidates,
@@ -10315,7 +10558,7 @@ async function showSummaryConsolidationPopup(popupOptions = {}) {
           itemAnalysis = await runSummaryAnalysisSequential(
             workItem.selectedEntries,
             workItem.analysisOptions,
-            null,
+            consolidationProfile,
           );
         } catch (e) {
           if (isStmbStopError(e)) return;
@@ -10346,10 +10589,10 @@ async function showSummaryConsolidationPopup(popupOptions = {}) {
                   ...workItem.analysisOptions,
                   lockedSummaries,
                 },
-                null,
+                consolidationProfile,
               );
             },
-            commitCandidates: async (candidates) => {
+            commitCandidates: async (candidates, consolidationRunId) => {
               let result = null;
               await withStmbWriteLane({ type: "lorebook", name: workItem.lorebookName }, async () => {
                 const freshLorebook = await loadWorldInfo(workItem.lorebookName);
@@ -10362,6 +10605,8 @@ async function showSummaryConsolidationPopup(popupOptions = {}) {
                   collectSummaryMemberIds(candidates),
                 );
                 result = await commitSummaryEntries({
+                  profileOrConnection: consolidationProfile,
+                  consolidationRunId,
                   lorebookName: workItem.lorebookName,
                   lorebookData: freshLorebook,
                   summaryCandidates: candidates,
@@ -10411,7 +10656,7 @@ async function showSummaryConsolidationPopup(popupOptions = {}) {
       analysis = await runSummaryAnalysisSequential(
         primarySelectedEntries,
         primaryAnalysisOptions,
-        null,
+        consolidationProfile,
       );
     } catch (e) {
       if (isStmbStopError(e)) {
@@ -10422,6 +10667,7 @@ async function showSummaryConsolidationPopup(popupOptions = {}) {
       } catch (e2) {}
       lastFailedArcError = e;
       lastFailedArcContext = {
+        profileSettings: consolidationProfile,
         lorebookName,
         lorebookData,
         selectedEntries: primarySelectedEntries,
@@ -10480,6 +10726,7 @@ async function showSummaryConsolidationPopup(popupOptions = {}) {
       };
       lastFailedArcError = syntheticError;
       lastFailedArcContext = {
+        profileSettings: consolidationProfile,
         lorebookName,
         lorebookData,
         selectedEntries: primarySelectedEntries,
@@ -10538,10 +10785,10 @@ async function showSummaryConsolidationPopup(popupOptions = {}) {
                 ...primaryAnalysisOptions,
                 lockedSummaries,
               },
-              null,
+              consolidationProfile,
             );
           },
-          commitCandidates: async (candidates) => {
+          commitCandidates: async (candidates, consolidationRunId) => {
             let result = null;
             await withStmbWriteLane({ type: "lorebook", name: lorebookName }, async () => {
               const freshLorebook = await loadWorldInfo(lorebookName);
@@ -10554,6 +10801,8 @@ async function showSummaryConsolidationPopup(popupOptions = {}) {
                 collectSummaryMemberIds(candidates),
               );
               result = await commitSummaryEntries({
+                profileOrConnection: consolidationProfile,
+                consolidationRunId,
                 lorebookName,
                 lorebookData: freshLorebook,
                 summaryCandidates: candidates,
@@ -10611,7 +10860,8 @@ async function showSummaryConsolidationPopup(popupOptions = {}) {
     }
 
     try {
-      const res2 = await commitSummaryEntries({
+      const res2 = await withStmbWriteLane({ type: "lorebook", name: lorebookName }, () => commitSummaryEntries({
+        profileOrConnection: consolidationProfile,
         lorebookName,
         lorebookData,
         summaryCandidates,
@@ -10623,7 +10873,7 @@ async function showSummaryConsolidationPopup(popupOptions = {}) {
         reverseStart: chosenArcReverseStart,
         entryMetadata: primaryEntryMetadata,
         applyCharacterFilters,
-      });
+      }));
       const created = Array.isArray(res2?.results)
         ? res2.results.length
         : summaryCandidates.length;
@@ -10741,7 +10991,9 @@ async function buildSettingsTemplateData({ includeSidePromptSets = false } = {})
     console.warn("STMemoryBooks: Failed to enumerate Regex scripts for UI", e);
   }
 
-  const selectedProfile = settings.profiles[settings.defaultProfile];
+  const chatProfileSelection = getChatProfileSelection(settings, sceneMarkers);
+  const selectedProfileIndex = resolveProfileIndex(settings, sceneMarkers);
+  const selectedProfile = settings.profiles[selectedProfileIndex];
   const defaultProfileTitleFormat = getDefaultProfileTitleFormat(settings);
   const isCustomTitleFormat = !getDefaultTitleFormats().includes(defaultProfileTitleFormat);
   const isManualMode = settings.moduleSettings.manualModeEnabled;
@@ -10811,6 +11063,7 @@ async function buildSettingsTemplateData({ includeSidePromptSets = false } = {})
     characterAwareMemories: settings.moduleSettings.characterAwareMemories !== false,
     useSeparateGroupSidePrompts: settings.moduleSettings.useSeparateGroupSidePrompts !== false,
     autoRollbackEnabled: settings.moduleSettings.autoRollbackEnabled === true,
+    autoRollbackApplyToBranches: settings.moduleSettings.autoRollbackApplyToBranches === true,
     autoRollbackUpdateLastProcessed:
       settings.moduleSettings.autoRollbackUpdateLastProcessed !== false,
     autoRollbackDeleteLastMemory:
@@ -10824,6 +11077,7 @@ async function buildSettingsTemplateData({ includeSidePromptSets = false } = {})
     memoryBoundaryMode: normalizeMemoryBoundaryMode(settings.moduleSettings.memoryBoundaryMode),
     memoryBoundaryModeOptions: getMemoryBoundaryModeOptions(settings.moduleSettings.memoryBoundaryMode),
     unhideBeforeMemory: settings.moduleSettings.unhideBeforeMemory || false,
+    topicalClipIncludeHiddenMessages: !!settings.moduleSettings.topicalClipIncludeHiddenMessages,
     refreshEditor: settings.moduleSettings.refreshEditor,
     allowSceneOverlap: settings.moduleSettings.allowSceneOverlap,
     manualModeEnabled: settings.moduleSettings.manualModeEnabled,
@@ -10850,6 +11104,7 @@ async function buildSettingsTemplateData({ includeSidePromptSets = false } = {})
     defaultGroupSidePromptSetOptions: buildDefaultSidePromptSetOptions(
       settings.moduleSettings.defaultGroupSidePromptSetKey,
     ),
+    ...Object.fromEntries(Object.keys(MEMORY_REMINDER_DEFAULTS).map(key => [key, settings.moduleSettings[key]])),
     autoSummaryEnabled: settings.moduleSettings.autoSummaryEnabled ?? false,
     autoSummaryInterval: settings.moduleSettings.autoSummaryInterval ?? 50,
     autoSummaryTriggerMode: settings.moduleSettings.autoSummaryTriggerMode ?? 'messages',
@@ -10870,6 +11125,8 @@ async function buildSettingsTemplateData({ includeSidePromptSets = false } = {})
       ...option,
       isSelected: autoConsolidationTargetTiers.includes(Number(option.value)),
     })),
+    inheritChatProfile: chatProfileSelection === "inherit",
+    missingChatProfile: chatProfileSelection === "missing",
     profiles: settings.profiles.map((profile, index) => ({
       ...profile,
       name:
@@ -10880,6 +11137,7 @@ async function buildSettingsTemplateData({ includeSidePromptSets = false } = {})
             )
           : profile.name,
       isDefault: index === settings.defaultProfile,
+      isSelected: String(index) === chatProfileSelection,
     })),
     titleFormat: defaultProfileTitleFormat,
     // Regex selection UI
@@ -10966,14 +11224,14 @@ async function showSettingsPopup() {
       }
 
       // Capture the currently selected profile before proceeding
-      let selectedProfileIndex = settings.defaultProfile;
+      let selectedProfileIndex = getChatProfileIndex(settings);
       if (currentPopupInstance && currentPopupInstance.dlg) {
         const profileSelect = currentPopupInstance.dlg.querySelector(
           "#stmb-profile-select",
         );
         if (profileSelect) {
           selectedProfileIndex =
-            parseInt(profileSelect.value) || settings.defaultProfile;
+            readIntInput(profileSelect, getChatProfileIndex(settings));
           console.log(
             `STMemoryBooks: Using profile index ${selectedProfileIndex} (${settings.profiles[selectedProfileIndex]?.name}) from main popup selection`,
           );
@@ -11220,6 +11478,7 @@ function setupSettingsEventListeners(popupInstance = currentPopupInstance) {
       "#stmb-auto-rollback-update-last-processed": "autoRollbackUpdateLastProcessed",
       "#stmb-auto-rollback-delete-last-memory": "autoRollbackDeleteLastMemory",
       "#stmb-auto-rollback-restore-side-prompts": "autoRollbackRestorePreviousSidePrompts",
+      "#stmb-auto-rollback-branches": "autoRollbackApplyToBranches",
     };
     for (const [selector, settingKey] of Object.entries(rollbackSettingBySelector)) {
       if (!e.target.matches(selector)) continue;
@@ -11347,6 +11606,12 @@ function setupSettingsEventListeners(popupInstance = currentPopupInstance) {
 
     if (e.target.matches("#stmb-unhide-before-memory")) {
       settings.moduleSettings.unhideBeforeMemory = e.target.checked;
+      saveSettingsDebounced();
+      return;
+    }
+
+    if (e.target.matches("#stmb-topical-clip-include-hidden-messages")) {
+      settings.moduleSettings.topicalClipIncludeHiddenMessages = e.target.checked;
       saveSettingsDebounced();
       return;
     }
@@ -11494,7 +11759,10 @@ function setupSettingsEventListeners(popupInstance = currentPopupInstance) {
     }
 
     if (e.target.matches("#stmb-profile-select")) {
-      const newIndex = clampInt(readIntInput(e.target), 0, settings.profiles.length - 1);
+      if (e.isTrusted && setChatProfileSelection(settings, getSceneMarkers(), e.target.value)) {
+        saveMetadataForCurrentContext();
+      }
+      const newIndex = clampInt(readIntInput(e.target, getChatProfileIndex(settings)), 0, settings.profiles.length - 1);
       if (newIndex >= 0 && newIndex < settings.profiles.length) {
         const selectedProfile = settings.profiles[newIndex];
         const summaryApi = popupElement.querySelector("#stmb-summary-api");
@@ -11565,7 +11833,7 @@ function setupSettingsEventListeners(popupInstance = currentPopupInstance) {
         // Update the preview
         if (summaryTitle) {
           const profileSelect = popupElement.querySelector("#stmb-profile-select");
-          const selectedIndex = clampInt(readIntInput(profileSelect, settings.defaultProfile), 0, settings.profiles.length - 1);
+          const selectedIndex = clampInt(readIntInput(profileSelect, getChatProfileIndex(settings)), 0, settings.profiles.length - 1);
           summaryTitle.textContent =
             selectedIndex === settings.defaultProfile
               ? e.target.value
@@ -11582,8 +11850,15 @@ function setupSettingsEventListeners(popupInstance = currentPopupInstance) {
       return;
     }
 
+    if (e.target.matches('[data-memory-reminder]')) {
+      if (persistMemoryReminderControls(popupElement, settings.moduleSettings)) saveSettingsDebounced();
+      getMemoryReminderController().check();
+      return;
+    }
+
     if (e.target.matches("#stmb-auto-summary-enabled")) {
       settings.moduleSettings.autoSummaryEnabled = e.target.checked;
+      getMemoryReminderController().check();
       saveSettingsDebounced();
       return;
     }
@@ -11625,6 +11900,7 @@ function setupSettingsEventListeners(popupInstance = currentPopupInstance) {
       const value = parseInt(e.target.value);
       if (!isNaN(value) && value >= 5 && value <= 200) {
         settings.moduleSettings.autoSummaryInterval = value;
+        getMemoryReminderController().check();
         saveSettingsDebounced();
       }
       return;
@@ -11645,6 +11921,7 @@ function setupSettingsEventListeners(popupInstance = currentPopupInstance) {
     if (e.target.matches("#stmb-auto-summary-buffer")) {
       const value = readIntInput(e.target);
       settings.moduleSettings.autoSummaryBuffer = clampInt(value ?? 0, 0, 50);
+      getMemoryReminderController().check();
       saveSettingsDebounced();
       return;
     }
@@ -11706,7 +11983,7 @@ function setupSettingsEventListeners(popupInstance = currentPopupInstance) {
         const summaryTitle = popupElement.querySelector("#stmb-summary-title");
         if (summaryTitle) {
           const profileSelect = popupElement.querySelector("#stmb-profile-select");
-          const selectedIndex = clampInt(readIntInput(profileSelect, settings.defaultProfile), 0, settings.profiles.length - 1);
+          const selectedIndex = clampInt(readIntInput(profileSelect, getChatProfileIndex(settings)), 0, settings.profiles.length - 1);
           summaryTitle.textContent =
             selectedIndex === settings.defaultProfile
               ? value
@@ -11730,7 +12007,7 @@ function setupSettingsEventListeners(popupInstance = currentPopupInstance) {
     if (summaryTitle) {
       const settings = initializeSettings();
       const profileSelect = popupElement.querySelector("#stmb-profile-select");
-      const selectedIndex = clampInt(readIntInput(profileSelect, settings.defaultProfile), 0, settings.profiles.length - 1);
+      const selectedIndex = clampInt(readIntInput(profileSelect, getChatProfileIndex(settings)), 0, settings.profiles.length - 1);
       if (selectedIndex === settings.defaultProfile) {
         summaryTitle.textContent = value;
       }
@@ -11738,16 +12015,28 @@ function setupSettingsEventListeners(popupInstance = currentPopupInstance) {
   });
 }
 
-/**
- * Persist all main popup settings currently present in the DOM.
- */
+/** Persist the shared reminder controls from either settings popup. */
+function persistMemoryReminderControls(popupElement, settings) {
+  let changed = false;
+  for (const [key, fallback] of Object.entries(MEMORY_REMINDER_DEFAULTS)) {
+    const control = popupElement.querySelector('[data-memory-reminder="' + key + '"]');
+    if (!control) continue;
+    const value = typeof fallback === 'boolean' ? control.checked
+      : normalizeReminderInterval(control.value, settings[key] ?? fallback);
+    if (typeof fallback !== 'boolean') control.value = String(value);
+    if (settings[key] !== value) { settings[key] = value; changed = true; }
+  }
+  return changed;
+}
+
+/** Persist all main popup settings currently present in the DOM. */
 function persistMainPopupSettings(popupElement) {
   if (!popupElement) {
     return false;
   }
 
   const settings = initializeSettings();
-  let hasChanges = false;
+  let hasChanges = persistMemoryReminderControls(popupElement, settings.moduleSettings);
   for (const [key, selector] of [
     ["characterAwareMemories", "#stmb-character-aware-memories"],
     ["useSeparateGroupSidePrompts", "#stmb-use-separate-group-side-prompts"],
@@ -11769,6 +12058,9 @@ function persistMainPopupSettings(popupElement) {
     autoRollbackEnabled:
       popupElement.querySelector("#stmb-auto-rollback-enabled")?.checked ??
       settings.moduleSettings.autoRollbackEnabled,
+    autoRollbackApplyToBranches:
+      popupElement.querySelector("#stmb-auto-rollback-branches")?.checked ??
+      settings.moduleSettings.autoRollbackApplyToBranches,
     autoRollbackUpdateLastProcessed:
       popupElement.querySelector("#stmb-auto-rollback-update-last-processed")?.checked ??
       settings.moduleSettings.autoRollbackUpdateLastProcessed,
@@ -11798,6 +12090,9 @@ function persistMainPopupSettings(popupElement) {
   const unhideBeforeMemory =
     popupElement.querySelector("#stmb-unhide-before-memory")?.checked ??
     settings.moduleSettings.unhideBeforeMemory;
+  const topicalClipIncludeHiddenMessages =
+    popupElement.querySelector("#stmb-topical-clip-include-hidden-messages")?.checked ??
+    settings.moduleSettings.topicalClipIncludeHiddenMessages;
   const refreshEditor =
     popupElement.querySelector("#stmb-refresh-editor")?.checked ??
     settings.moduleSettings.refreshEditor;
@@ -11937,6 +12232,10 @@ function persistMainPopupSettings(popupElement) {
 
   if (unhideBeforeMemory !== settings.moduleSettings.unhideBeforeMemory) {
     settings.moduleSettings.unhideBeforeMemory = unhideBeforeMemory;
+    hasChanges = true;
+  }
+  if (topicalClipIncludeHiddenMessages !== settings.moduleSettings.topicalClipIncludeHiddenMessages) {
+    settings.moduleSettings.topicalClipIncludeHiddenMessages = topicalClipIncludeHiddenMessages;
     hasChanges = true;
   }
 
@@ -12098,6 +12397,7 @@ function persistMainPopupSettings(popupElement) {
     saveSettingsDebounced();
   }
 
+  getMemoryReminderController().check();
   return hasChanges;
 }
 
@@ -12149,7 +12449,7 @@ async function refreshPopupContent() {
       "#stmb-profile-select",
     );
     if (profileSelect) {
-      profileSelect.value = settings.defaultProfile;
+      profileSelect.value = getChatProfileSelection(settings, getSceneMarkers());
       // Trigger change event to update profile summary
       profileSelect.dispatchEvent(new Event("change"));
     }
@@ -12196,6 +12496,16 @@ function processExistingMessages() {
  * Register slash commands using proper SlashCommand classes
  */
 function registerSlashCommands() {
+  SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+    name: "memory-assist",
+    callback: (_namedArgs, unnamedArgs) => runMemoryAssistanceCommand(unnamedArgs),
+    helpString: translate("Memory Assistance", "STMemoryBooks_ClipReview_Name") + " — /memory-assist [X-Y]",
+    unnamedArgumentList: [SlashCommandArgument.fromProps({
+      description: "X-Y",
+      typeList: [ARGUMENT_TYPE.STRING],
+      isRequired: false,
+    })],
+  }));
   const createMemoryCmd = SlashCommand.fromProps({
     name: "creatememory",
     callback: handleCreateMemoryCommand,
@@ -12467,18 +12777,25 @@ function getLorebookDataFingerprint(data) {
   return fingerprintRollbackEntry(data);
 }
 
-async function loadMemoryRollbackLorebooks(settings) {
-  const names = Array.from(getCurrentChatLorebookNames(settings))
+async function loadMemoryRollbackLorebooks(settings, namesOverride = null, { skipUnavailable = false } = {}) {
+  const names = Array.from(namesOverride || getCurrentChatLorebookNames(settings))
     .sort((left, right) => left.localeCompare(right));
   const states = [];
   for (const name of names) {
-    const data = await loadWorldInfo(name);
-    if (!data || typeof data !== "object") {
-      throw new Error(tr(
-        "STMemoryBooks_AutoRollback_LoadFailed",
-        "Memory rollback could not safely load Memory Book {{name}}. Repair or remove the unavailable book, then try again.",
-        { name },
-      ));
+    let data;
+    try {
+      data = await loadWorldInfo(name);
+      if (!data || typeof data !== "object") {
+        throw new Error(tr(
+          "STMemoryBooks_AutoRollback_LoadFailed",
+          "Memory rollback could not safely load Memory Book {{name}}. Repair or remove the unavailable book, then try again.",
+          { name },
+        ));
+      }
+    } catch (error) {
+      if (!skipUnavailable) throw error;
+      console.warn("STMemoryBooks: Skipping unavailable Memory Book during rollback unhide recovery:", name, error);
+      continue;
     }
     states.push({
       name,
@@ -12633,7 +12950,104 @@ async function waitForMemoryRollbackIdle(chatKey) {
   return getStmbChatKey() === chatKey;
 }
 
-async function executeMemoryAutoRollback({ chatKey, chatId, deletion }) {
+const pendingDeletedUnhideKey = "STMB_pendingDeletedMessageRollbackUnhide";
+
+function unsafeDeletedUnhideError(records) {
+  const error = new Error(translate(
+    "Messages changed since Memory rollback. Hidden messages could not be restored safely; review the remaining chat before unhiding them manually.",
+    "STMemoryBooks_AutoRollback_UnhideUnsafe",
+  ));
+  error.code = "STMB_UNSAFE_DELETED_UNHIDE";
+  error.records = records;
+  return error;
+}
+
+async function validateDeletedMessageUnhideRecords(records, chatKey, chatId) {
+  if (getStmbChatKey() !== chatKey || getMemoryRollbackChatId() !== chatId) return false;
+  const unsafeRecords = [];
+  for (const record of records) {
+    const end = Array.isArray(record.ranges) ? record.ranges.at(-1)?.end : undefined;
+    if (!Number.isInteger(end) || record.prefixEnd !== end
+      || !Array.isArray(record.ranges)
+      || record.ranges.some(range => !range || !Number.isInteger(range.start)
+        || !Number.isInteger(range.end) || range.start < 0 || range.end < range.start)
+      || await fingerprintRollbackChatPrefix(chat, end) !== record.fingerprint) {
+      unsafeRecords.push(record);
+    }
+  }
+  if (getStmbChatKey() !== chatKey || getMemoryRollbackChatId() !== chatId) return false;
+  if (unsafeRecords.length > 0) throw unsafeDeletedUnhideError(unsafeRecords);
+  return true;
+}
+
+async function replayDeletedMessageRollbackUnhide(states, chatKey, chatId) {
+  const pending = states.filter(state => state.data[pendingDeletedUnhideKey]?.version === 1
+    && state.data[pendingDeletedUnhideKey].chatId === chatId);
+  if (pending.length === 0) return;
+  const records = pending.map(state => state.data[pendingDeletedUnhideKey]);
+  if (!await validateDeletedMessageUnhideRecords(records, chatKey, chatId)) return;
+  const ranges = getChildRollbackUnhideRanges(records.flatMap(record => record.ranges), chat.length);
+  for (const range of ranges) {
+    if (!await validateDeletedMessageUnhideRecords(records, chatKey, chatId)) return;
+    await executeSlashCommands(`/unhide ${range.start}-${range.end}`);
+  }
+  if (!await validateDeletedMessageUnhideRecords(records, chatKey, chatId)) return;
+  await clearDeletedMessageRollbackUnhide(pending);
+}
+
+async function clearDeletedMessageRollbackUnhide(states) {
+  const cleanup = states.map(state => {
+    const data = structuredClone(state.data);
+    delete data[pendingDeletedUnhideKey];
+    return { ...state, data, originalData: state.data,
+      originalFingerprint: getLorebookDataFingerprint(state.data) };
+  });
+  await saveMemoryRollbackLorebooks(cleanup);
+}
+
+async function recoverDeletedMessageRollbackUnhide(chatKey, chatId) {
+  if (!chatKey || !chatId) return;
+  const settings = initializeSettings();
+  if (settings.moduleSettings?.autoRollbackEnabled !== true) return;
+  let states = await loadMemoryRollbackLorebooks(settings, null, { skipUnavailable: true });
+  if (getStmbChatKey() !== chatKey || getMemoryRollbackChatId() !== chatId) return;
+  let warned = false;
+  while (states.length > 0) {
+    try {
+      await replayDeletedMessageRollbackUnhide(states, chatKey, chatId);
+      return;
+    } catch (error) {
+      if (error?.code !== "STMB_UNSAFE_DELETED_UNHIDE") throw error;
+      const unsafe = states.filter(state => error.records.includes(state.data[pendingDeletedUnhideKey]));
+      if (unsafe.length === 0) throw error;
+      if (!warned) {
+        toastr.warning(error.message, undefined, { timeOut: 10000, extendedTimeOut: 1000 });
+        warned = true;
+      }
+      await clearDeletedMessageRollbackUnhide(unsafe);
+      states = states.filter(state => !unsafe.includes(state));
+      if (getStmbChatKey() !== chatKey || getMemoryRollbackChatId() !== chatId) return;
+    }
+  }
+}
+
+function queueDeletedMessageRollbackUnhideRecovery(chatKey, chatId) {
+  if (!chatKey || !chatId) return;
+  const previous = memoryRollbackChains.get(chatKey) || Promise.resolve();
+  const current = previous.catch(() => {}).then(() => recoverDeletedMessageRollbackUnhide(chatKey, chatId));
+  memoryRollbackChains.set(chatKey, current);
+  current.catch(error => {
+    console.error("STMemoryBooks: Message rollback unhide recovery failed:", error);
+    toastr.error(error?.message || String(error), translate("Memory rollback failed", "STMemoryBooks_AutoRollback_Failed"), {
+      timeOut: 0, extendedTimeOut: 0,
+    });
+  }).finally(() => {
+    if (memoryRollbackChains.get(chatKey) === current) memoryRollbackChains.delete(chatKey);
+  });
+}
+
+async function executeMemoryAutoRollback({ chatKey, chatId, deletion, childBoundary = null }) {
+  const isChildChatRollback = Number.isInteger(childBoundary) && childBoundary >= 0;
   const settings = initializeSettings();
   const options = {
     autoRollbackEnabled: settings.moduleSettings?.autoRollbackEnabled === true,
@@ -12644,13 +13058,20 @@ async function executeMemoryAutoRollback({ chatKey, chatId, deletion }) {
     refreshEditor: settings.moduleSettings?.refreshEditor !== false,
   };
   if (!options.autoRollbackEnabled) return;
-  if (!options.autoRollbackUpdateLastProcessed
+  if (!isChildChatRollback) {
+    await recoverDeletedMessageRollbackUnhide(chatKey, chatId);
+    if (getStmbChatKey() !== chatKey || getMemoryRollbackChatId() !== chatId) return;
+  }
+  if (!isChildChatRollback && !options.autoRollbackUpdateLastProcessed
     && !options.autoRollbackDeleteLastMemory
     && !options.autoRollbackRestorePreviousSidePrompts) return;
 
+  if (isChildChatRollback) {
+    deletion = { start: childBoundary, end: Number.MAX_SAFE_INTEGER, count: 0, isTail: true };
+  }
   const markers = getSceneMarkers() || {};
   const oldCheckpoint = markers.highestMemoryProcessed;
-  if (!Number.isFinite(oldCheckpoint) || deletion.start > oldCheckpoint) return;
+  if (!isChildChatRollback && (!Number.isFinite(oldCheckpoint) || deletion.start > oldCheckpoint)) return;
   if (!await waitForMemoryRollbackIdle(chatKey)) return;
 
   const states = await loadMemoryRollbackLorebooks(settings);
@@ -12697,7 +13118,7 @@ async function executeMemoryAutoRollback({ chatKey, chatId, deletion }) {
 
   const selectedCount = Array.from(selectionsByBook.values()).reduce((total, set) => total + set.size, 0);
   const knownCheckpoint = computeRollbackCheckpoint(states, chatId);
-  if (selectedCount === 0 && knownCheckpoint === null && !markers.highestMemoryProcessedManuallySet) {
+  if (!isChildChatRollback && selectedCount === 0 && knownCheckpoint === null && !markers.highestMemoryProcessedManuallySet) {
     throw new Error(translate(
       "No exact Memory entries were found for the processed range. Repair legacy or missing Memory metadata before retrying.",
       "STMemoryBooks_AutoRollback_NoMemories",
@@ -12729,11 +13150,20 @@ async function executeMemoryAutoRollback({ chatKey, chatId, deletion }) {
   if (getStmbChatKey() !== chatKey || getMemoryRollbackChatId() !== chatId) return;
 
   const rollbackRanges = states.flatMap(state => Object.entries(state.data?.entries || {})
-    .filter(([entryKey, entry]) => selectionsByBook.get(state.name)?.has(String(entry.uid ?? entryKey)))
+    .filter(([entryKey, entry]) => isRollbackBaseMemory(entry)
+      && selectionsByBook.get(state.name)?.has(String(entry.uid ?? entryKey)))
     .map(([, entry]) => getRangeFromMemoryEntry(entry))
     .filter(Boolean))
     .filter((range, index, all) => all.findIndex(candidate =>
       candidate.start === range.start && candidate.end === range.end) === index);
+  if (isChildChatRollback) rollbackRanges.push({ start: childBoundary, end: Number.MAX_SAFE_INTEGER });
+  const deletedUnhideRanges = !isChildChatRollback && options.autoRollbackDeleteLastMemory
+    ? getDeletedMessageRollbackUnhideRanges(rollbackRanges, deletion, chat.length) : [];
+  const deletedUnhideFingerprint = deletedUnhideRanges.length > 0
+    ? await fingerprintRollbackChatPrefix(chat, deletedUnhideRanges.at(-1).end) : null;
+  if (deletedUnhideRanges.length > 0 && !deletedUnhideFingerprint) {
+    throw new Error("STMemoryBooks: Could not identify retained messages for rollback.");
+  }
   let restoredSidePrompts = 0;
   let skippedChangedSidePrompts = 0;
   let legacySidePrompts = 0;
@@ -12747,6 +13177,7 @@ async function executeMemoryAutoRollback({ chatKey, chatId, deletion }) {
         else if (result.reason === "entry-changed") skippedChangedSidePrompts++;
       }
     }
+    for (const state of states) reconcileSidePromptHistoryStates(state.data);
   }
 
   const affectedOnlyMiddle = !deletion.isTail && scope === ROLLBACK_SCOPE_AFFECTED;
@@ -12766,8 +13197,31 @@ async function executeMemoryAutoRollback({ chatKey, chatId, deletion }) {
 
   const changedStates = states.filter(state =>
     getLorebookDataFingerprint(state.data) !== state.originalFingerprint);
+  // Keep recovery data in the same write as the deletions it describes. Chat
+  // metadata saves are debounced and cannot provide that guarantee.
+  const pendingUnhideKey = "STMB_pendingChildRollbackUnhide";
+  const pendingUnhideStates = isChildChatRollback ? states.filter(state =>
+    state.data[pendingUnhideKey]?.version === 1
+      && state.data[pendingUnhideKey].chatId === chatId) : [];
+  const unhideRanges = isChildChatRollback ? getChildRollbackUnhideRanges([
+    ...pendingUnhideStates.flatMap(state => state.data[pendingUnhideKey].ranges),
+    ...(options.autoRollbackDeleteLastMemory ? rollbackRanges : []),
+  ], childBoundary) : [];
+  if (unhideRanges.length > 0) {
+    for (const state of changedStates) {
+      state.data[pendingUnhideKey] = { version: 1, chatId, ranges: unhideRanges };
+      if (!pendingUnhideStates.includes(state)) pendingUnhideStates.push(state);
+    }
+  }
+  if (deletedUnhideRanges.length > 0) {
+    const record = { version: 1, chatId, ranges: deletedUnhideRanges,
+      prefixEnd: deletedUnhideRanges.at(-1).end, fingerprint: deletedUnhideFingerprint };
+    for (const state of changedStates) state.data[pendingDeletedUnhideKey] = record;
+  }
   await saveMemoryRollbackLorebooks(changedStates);
+  if (getStmbChatKey() !== chatKey || getMemoryRollbackChatId() !== chatId) return;
 
+  // Match the saved rollback before unhide replay can fail or switch chats.
   if (options.autoRollbackUpdateLastProcessed) {
     invalidatePendingProgress();
     const checkpoint = computeRollbackCheckpoint(states, chatId, selectionsByBook);
@@ -12775,6 +13229,28 @@ async function executeMemoryAutoRollback({ chatKey, chatId, deletion }) {
     else markers.highestMemoryProcessed = checkpoint;
     delete markers.highestMemoryProcessedManuallySet;
     saveMetadataForCurrentContext();
+  }
+
+  if (deletedUnhideRanges.length > 0) {
+    await replayDeletedMessageRollbackUnhide(changedStates, chatKey, chatId);
+    if (getStmbChatKey() !== chatKey || getMemoryRollbackChatId() !== chatId) return;
+  }
+
+  for (const range of unhideRanges) {
+    await executeSlashCommands(`/unhide ${range.start}-${range.end}`);
+    if (getStmbChatKey() !== chatKey || getMemoryRollbackChatId() !== chatId) return;
+  }
+  // Replay the whole receipt after interruption: /unhide is idempotent. Only
+  // discard receipts once every range has run in the intended chat.
+  if (pendingUnhideStates.length > 0) {
+    const cleanupStates = pendingUnhideStates.map(state => {
+      const data = structuredClone(state.data);
+      delete data[pendingUnhideKey];
+      return { ...state, data, originalData: state.data,
+        originalFingerprint: getLorebookDataFingerprint(state.data) };
+    });
+    await saveMemoryRollbackLorebooks(cleanupStates);
+    if (getStmbChatKey() !== chatKey || getMemoryRollbackChatId() !== chatId) return;
   }
 
   if (options.refreshEditor) {
@@ -12785,6 +13261,19 @@ async function executeMemoryAutoRollback({ chatKey, chatId, deletion }) {
         console.warn(`STMemoryBooks: rollback saved ${state.name}, but its editor did not refresh:`, error);
       }
     }
+  }
+  if (isChildChatRollback) {
+    const stmbMetadata = chat_metadata.STMemoryBooks && typeof chat_metadata.STMemoryBooks === "object"
+      ? chat_metadata.STMemoryBooks
+      : (chat_metadata.STMemoryBooks = {});
+    stmbMetadata.autoRollbackForChild = {
+      version: 1,
+      childChatId: chatId,
+      retainedBoundary: childBoundary,
+      status: "completed",
+      completedAt: new Date().toISOString(),
+    };
+    saveMetadataForCurrentContext();
   }
   eventSource.emit(MEMORY_TIER_CACHE_REFRESH_EVENT);
   refreshMemoryBoundaryUi();
@@ -12813,6 +13302,48 @@ async function executeMemoryAutoRollback({ chatKey, chatId, deletion }) {
     "Memory rollback completed for {{count}} Memory entry or entries.",
     { count: selectedCount },
   ), "STMemoryBooks");
+}
+
+async function executeChildChatAutoRollback({ chatId, boundary }) {
+  const settings = initializeSettings();
+  if (settings.moduleSettings?.autoRollbackEnabled !== true
+    || settings.moduleSettings?.autoRollbackApplyToBranches !== true) return;
+  const stmbMetadata = chat_metadata?.STMemoryBooks;
+  const branchMarker = stmbMetadata?.branchLorebookCopies;
+  if (!getBranchLorebookController().hasVerifiedCopies(chatId)) {
+    toastr.warning(translate(
+      "Branch/checkpoint auto-rollback was skipped because independent copies of every active Memory Book could not be verified.",
+      "STMemoryBooks_AutoRollbackBranchIsolation",
+    ), "STMemoryBooks");
+    return;
+  }
+  const prior = stmbMetadata.autoRollbackForChild;
+  if (prior?.version === 1 && prior.status === "completed"
+    && String(prior.childChatId || "") === String(chatId || "")) return;
+
+  const chatKey = getStmbChatKey();
+  const runKey = JSON.stringify([chatKey, chatId, boundary]);
+  if (childMemoryRollbackInFlight.has(runKey)) return;
+  childMemoryRollbackInFlight.add(runKey);
+  const previous = memoryRollbackChains.get(chatKey) || Promise.resolve();
+  const current = previous.catch(() => {}).then(() => executeMemoryAutoRollback({
+    chatKey,
+    chatId,
+    childBoundary: boundary,
+  }));
+  memoryRollbackChains.set(chatKey, current);
+  try {
+    await current;
+  } catch (error) {
+    console.error("STMemoryBooks: Branch/checkpoint auto-rollback failed:", error);
+    toastr.error(error?.message || String(error), translate("Memory rollback failed", "STMemoryBooks_AutoRollback_Failed"), {
+      timeOut: 0,
+      extendedTimeOut: 0,
+    });
+  } finally {
+    childMemoryRollbackInFlight.delete(runKey);
+    if (memoryRollbackChains.get(chatKey) === current) memoryRollbackChains.delete(chatKey);
+  }
 }
 
 function queueMemoryAutoRollback({ chatKey, chatId, deletion }) {
@@ -12844,12 +13375,6 @@ function setupEventListeners() {
 
   getBranchLorebookController().initialize();
   eventSource.on(event_types.CHAT_CHANGED, handleChatChanged);
-  eventSource.on(event_types.CHAT_CHANGED, () => {
-    narratorGenerationSnapshot = null;
-    narratorGenerationType = null;
-    manualGroupGenerationSnapshot = null;
-    refreshNarratorCastDrawer();
-  });
   eventSource.on(MEMORY_TIER_CACHE_REFRESH_EVENT, refreshMemoryTierMacroCache);
   eventSource.on(event_types.WORLDINFO_UPDATED, (name, data) => {
     updateMemoryTierMacroCache(name, data);
@@ -12927,10 +13452,14 @@ function setupEventListeners() {
   });
   eventSource.on(event_types.MESSAGE_RECEIVED, (messageId, type) => {
     memoryRollbackDeletionTracker.snapshot(getStmbChatKey(), chat);
-    if (!narratorGenerationSnapshot || !getCurrentMemoryBooksContext().isNarratorMode) return;
+    const generation = narratorResponseGeneration.receive({
+      messageId, type, chatKey: getStmbChatKey(), chat,
+      narratorMode: getCurrentMemoryBooksContext().isNarratorMode,
+      processor: streamingProcessor,
+    });
+    if (!generation) return;
     const message = chat?.[messageId];
-    if (!message || message.is_system) return;
-    stampNarratorCast(message, narratorGenerationSnapshot, { merge: type === "continue" || narratorGenerationType === "continue" });
+    stampNarratorCast(message, generation.castIds, { merge: generation.merge });
     saveChatDebounced();
   });
   eventSource.on(event_types.MESSAGE_RECEIVED, handleMessageReceived);
@@ -12957,10 +13486,13 @@ function setupEventListeners() {
     lastFailedAIError = null;
     lastFailedAIContext = null;
     const context = getCurrentMemoryBooksContext();
-    narratorGenerationType = context.isNarratorMode ? type : null;
     narratorGenerationSnapshot = context.isNarratorMode
       ? [...getCurrentNarratorConfig().activeCastIds]
       : null;
+    narratorResponseGeneration.start({
+      castIds: narratorGenerationSnapshot || [], type, chatKey: getStmbChatKey(), chat,
+      dryRun, narratorMode: context.isNarratorMode,
+    });
     manualGroupGenerationSnapshot =
       context.isGroupChat && !isCharacterAwarenessDisabled({}, context) && initializeSettings()?.moduleSettings?.manualModeEnabled
         ? createManualGroupLorebookBindingSnapshot()
@@ -12969,11 +13501,16 @@ function setupEventListeners() {
 
   const clearGenerationLorebookSnapshots = () => {
     narratorGenerationSnapshot = null;
-    narratorGenerationType = null;
     manualGroupGenerationSnapshot = null;
   };
-  eventSource.on(event_types.GENERATION_ENDED, clearGenerationLorebookSnapshots);
-  eventSource.on(event_types.GENERATION_STOPPED, clearGenerationLorebookSnapshots);
+  eventSource.on(event_types.GENERATION_ENDED, () => {
+    narratorResponseGeneration.end({ processor: streamingProcessor, chat });
+    clearGenerationLorebookSnapshots();
+  });
+  eventSource.on(event_types.GENERATION_STOPPED, () => {
+    narratorResponseGeneration.clear();
+    clearGenerationLorebookSnapshots();
+  });
 
   eventSource.on(event_types.WORLDINFO_ENTRIES_LOADED, async ({ globalLore, characterLore, chatLore, personaLore }) => {
     const arrays = [globalLore, characterLore, chatLore, personaLore].filter(Array.isArray);
@@ -13074,6 +13611,7 @@ function setupEventListeners() {
  * Show a popup with details for a failed AI response, including raw response and provider body if available.
  */
 async function applyManualFixedJson(correctedRaw) {
+  const reminderChatKey = getStmbChatKey();
   if (isProcessingMemory) {
     toastr.warning(
       translate(
@@ -13359,6 +13897,7 @@ async function applyManualFixedJson(correctedRaw) {
     // ALWAYS reset the flag, no matter how we exit.
     // This clears the `isProcessingMemory` flag set inside the try block above.
     isProcessingMemory = false;
+    if (getStmbChatKey() === reminderChatKey) getMemoryReminderController().check({ notify: true });
   }
 }
 
@@ -13530,7 +14069,8 @@ async function applyManualFixedSummaryJson(correctedRaw) {
 
     const targetTier = clampInt(Number(context?.targetTier ?? 1), 1, 6);
     const targetLabel = getSummaryTierLabel(targetTier);
-    const res = await commitSummaryEntries({
+    const res = await withStmbWriteLane({ type: "lorebook", name: context.lorebookName }, () => commitSummaryEntries({
+      profileOrConnection: context.profileSettings || null,
       lorebookName: context.lorebookName,
       lorebookData: context.lorebookData,
       summaryCandidates,
@@ -13548,7 +14088,7 @@ async function applyManualFixedSummaryJson(correctedRaw) {
           : fallbackReverseStart,
       entryMetadata: context.entryMetadata,
       applyCharacterFilters: context.applyCharacterFilters,
-    });
+    }));
 
     const created = Array.isArray(res?.results)
       ? res.results.length
@@ -14021,6 +14561,9 @@ async function init() {
 
   // Initialize settings with validation
   const settings = initializeSettings();
+  if (getUnfinishedConsolidationCheckpoints().length > 0) {
+    setTimeout(() => { void showConsolidationRecoveryPopup(); }, 1000);
+  }
   const profileValidation = validateAndFixProfiles(settings);
   initializePendingProgress({
     getChatRef: getCurrentStmbChatRef,
@@ -14028,7 +14571,9 @@ async function init() {
     resolved: (chatKey) => {
       if (getStmbChatKey() !== chatKey) return;
       refreshMemoryBoundaryUi();
-      if (!hasPendingProgress()) void handleAutoSummaryMessageReceived();
+      if (!hasPendingProgress()) void handleAutoSummaryMessageReceived().then(() => {
+        if (getStmbChatKey() === chatKey) getMemoryReminderController().check({ notify: true });
+      });
     },
   });
 
@@ -14077,6 +14622,7 @@ async function init() {
   // Setup event listeners
   memoryRollbackDeletionTracker.snapshot(getStmbChatKey(), chat);
   setupEventListeners();
+  queueDeletedMessageRollbackUnhideRecovery(getStmbChatKey(), getMemoryRollbackChatId());
   initializeLorebookRegenerationObserver();
   registerMemoryTierMacros();
   await refreshMemoryTierMacroCache();

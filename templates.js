@@ -162,11 +162,15 @@ export const settingsTemplate = Handlebars.compile(`
 
         <div class="world_entry_form_control">
             <select id="stmb-profile-select" class="text_pole">
+                <option value="inherit" {{#if inheritChatProfile}}selected{{/if}} data-i18n="STMemoryBooks_Profile_UseGlobalDefault">Use global default</option>
+                {{#if missingChatProfile}}<option value="missing" selected data-i18n="STMemoryBooks_Profile_MissingFallback">Missing profile — using the default</option>{{/if}}
                 {{#each profiles}}
-                <option value="{{@index}}" {{#if isDefault}}selected{{/if}}>{{name}}{{#if isDefault}} (Default){{/if}}</option>
+                <option value="{{@index}}" {{#if isSelected}}selected{{/if}}>{{name}}{{#if isDefault}} (Default){{/if}}</option>
                 {{/each}}
             </select>
         </div>
+
+        <small class="opacity50p" data-i18n="STMemoryBooks_Profile_RememberChat">Profile selections are remembered for this chat.</small>
 
         <div id="stmb-profile-summary" class="padding10 marginBot10">
             <div class="marginBot5" data-i18n="STMemoryBooks_ProfileSettings">Profile Settings:</div>
@@ -204,11 +208,39 @@ export const settingsTemplate = Handlebars.compile(`
 
 `);
 
-/**
- * General settings popup template
- */
+/** Automatic reminder controls are only shown in Automatic Memories. */
+const automaticMemoryReminderSettingsFragment = `
+    <div class="world_entry_form_control">
+        <label class="checkbox_label">
+            <input type="checkbox" data-memory-reminder="automaticMemoryReminders" {{#if automaticMemoryReminders}}checked{{/if}}>
+            <span data-i18n="STMemoryBooks_Reminder_AutomaticEnabled">Turn on reminders for automatic memories</span>
+        </label>
+        <label>
+            <span data-i18n="STMemoryBooks_Reminder_AutomaticInterval">Automatic reminder interval (messages)</span>
+            <input type="number" class="text_pole" data-memory-reminder="automaticMemoryReminderInterval" value="{{automaticMemoryReminderInterval}}" min="1" step="1">
+        </label>
+        <small class="opacity50p" data-i18n="STMemoryBooks_Reminder_AutomaticHelp">When auto-create is on, first remind at the message interval plus buffer plus this many messages, then repeat every this many additional messages. Always counts chat messages, even with token-triggered generation.</small>
+    </div>
+`;
+
+const manualMemoryReminderSettingsFragment = `
+    <div class="world_entry_form_control">
+        <label class="checkbox_label">
+            <input type="checkbox" data-memory-reminder="manualMemoryReminders" {{#if manualMemoryReminders}}checked{{/if}}>
+            <span data-i18n="STMemoryBooks_Reminder_ManualEnabled">Turn on reminders to make memories manually</span>
+        </label>
+        <label>
+            <span data-i18n="STMemoryBooks_Reminder_ManualInterval">Manual reminder interval (messages)</span>
+            <input type="number" class="text_pole" data-memory-reminder="manualMemoryReminderInterval" value="{{manualMemoryReminderInterval}}" min="1" step="1">
+        </label>
+        <small class="opacity50p" data-i18n="STMemoryBooks_Reminder_ManualHelp">When auto-create is off, remind after this many unprocessed chat messages, then repeat every this many additional messages.</small>
+        <small class="opacity50p" data-i18n="STMemoryBooks_Reminder_CommonHelp">Reminders stay visible until dismissed and work independently of Show notifications.</small>
+    </div>
+`;
+
 export const generalSettingsTemplate = Handlebars.compile(`
     <h3 class="stmb-section-title" data-i18n="STMemoryBooks_Preferences">General Settings</h3>
+    ${manualMemoryReminderSettingsFragment}
 
     <div class="world_entry_form_control">
         <label class="checkbox_label">
@@ -273,6 +305,11 @@ export const generalSettingsTemplate = Handlebars.compile(`
                     <input type="checkbox" id="stmb-auto-rollback-restore-side-prompts" {{#if autoRollbackRestorePreviousSidePrompts}}checked{{/if}} {{#unless autoRollbackEnabled}}disabled{{/unless}}>
                     <span data-i18n="STMemoryBooks_AutoRollbackRestoreSidePrompts">Restore previous Side Prompts</span>
                 </label>
+                <label class="checkbox_label">
+                    <input type="checkbox" id="stmb-auto-rollback-branches" {{#if autoRollbackApplyToBranches}}checked{{/if}} {{#unless autoRollbackEnabled}}disabled{{/unless}}>
+                    <span data-i18n="STMemoryBooks_AutoRollbackBranches">Apply auto-rollback to branches/checkpoints</span>
+                </label>
+                <small class="opacity50p" data-i18n="STMemoryBooks_AutoRollbackBranchesDesc">When a branch or checkpoint is opened, roll back Memories beyond its retained messages. This requires independent Memory Book copies.</small>
                 <small class="warning" data-i18n="STMemoryBooks_AutoRollbackSidePromptLimit">Side Prompts can be rolled back only once, to their latest exact saved state. Older rollback layers are not retained.</small>
             </div>
         </div>
@@ -399,6 +436,12 @@ export const generalSettingsTemplate = Handlebars.compile(`
             <span data-i18n="STMemoryBooks_UnhideBeforeMemory">Unhide hidden messages for memory generation (runs /unhide X-Y)</span>
         </label>
     </div>
+    <div class="world_entry_form_control">
+        <label class="checkbox_label">
+            <input type="checkbox" id="stmb-topical-clip-include-hidden-messages" {{#if topicalClipIncludeHiddenMessages}}checked{{/if}}>
+            <span data-i18n="STMemoryBooks_TopicalClip_IncludeHiddenMessages">Also use hidden messages</span>
+        </label>
+    </div>
 `);
 
 /**
@@ -406,6 +449,8 @@ export const generalSettingsTemplate = Handlebars.compile(`
  */
 export const automaticMemoriesSettingsTemplate = Handlebars.compile(`
     <h3 class="stmb-section-title" data-i18n="STMemoryBooks_AutoMemory">Automatic Memories</h3>
+    ${automaticMemoryReminderSettingsFragment}
+    ${manualMemoryReminderSettingsFragment}
 
     <div class="world_entry_form_control">
         <label class="checkbox_label">
@@ -538,7 +583,7 @@ export const advancedOptionsTemplate = Handlebars.compile(`
             <small data-i18n="STMemoryBooks_ChangeProfileDesc">Change the profile to use different base settings.</small>
             <select id="stmb-profile-select-advanced" class="text_pole">
                 {{#each profiles}}
-                <option value="{{@index}}" {{#if isDefault}}selected{{/if}}>{{name}}{{#if isDefault}} (Default){{/if}}</option>
+                <option value="{{@index}}" {{#if isSelected}}selected{{/if}}>{{name}}{{#if isDefault}} (Default){{/if}}</option>
                 {{/each}}
             </select>
         </label>

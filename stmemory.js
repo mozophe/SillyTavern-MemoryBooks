@@ -21,6 +21,7 @@ import {
 import { resolveCustomConnectionProfile } from './customConnectionProfiles.js';
 import { applyOpenRouterRoutingSettings } from './openRouterRouting.js';
 import { attachChatCompletionServiceError } from './chatCompletionServiceError.js';
+import { getSelectedConnectionProfile, prepareConnectionProfileRequest } from './connectionProfileRequest.js';
 import { tr } from './i18nHelpers.js';
 const $ = window.jQuery;
 
@@ -72,13 +73,20 @@ function cloneScriptEnabled(script) {
  * Apply selected regex scripts (by flat index keys, e.g., "idx:0") in order.
  * Uses getRegexScripts({ allowedOnly: false }) as the single source of truth.
  * Bypasses engine gating; relies on explicit user selection.
+ * Outgoing callers use throwOnError to abort requests when a transformation fails.
  */
-export function applySelectedRegex(inputText, selectedKeys) {
+export function applySelectedRegex(inputText, selectedKeys, { throwOnError = false } = {}) {
     if (typeof inputText !== 'string') return '';
     if (!Array.isArray(selectedKeys) || selectedKeys.length === 0) return inputText;
 
     try {
         const all = getRegexScripts({ allowedOnly: false }) || [];
+        if (throwOnError && selectedKeys.some(k => {
+            const index = Number(String(k).replace(/^idx:/, ''));
+            return !Number.isInteger(index) || index < 0 || index >= all.length || !all[index];
+        })) {
+            throw new Error('Selected outgoing regex script is unavailable');
+        }
         const order = selectedKeys
             .map(k => Number(String(k).replace(/^idx:/, '')))
             .filter(i => Number.isInteger(i) && i >= 0 && i < all.length);
@@ -88,12 +96,15 @@ export function applySelectedRegex(inputText, selectedKeys) {
             const script = cloneScriptEnabled(all[i]);
             try {
                 out = runRegexScript(script, out);
+                if (throwOnError && typeof out !== 'string') throw new Error('Outgoing regex returned non-text output');
             } catch (e) {
+                if (throwOnError) throw e;
                 console.warn('applySelectedRegex: script failed', i, e);
             }
         }
         return out;
     } catch (e) {
+        if (throwOnError) throw e;
         console.warn('applySelectedRegex failed', e);
         return inputText;
     }
@@ -344,9 +355,9 @@ function getChatCompletionServiceOrNull() {
     return null;
 }
 
-async function sendViaChatCompletionService(body, signal, presetName = '') {
-    const service = getChatCompletionServiceOrNull();
-    if (!service) {
+async function sendViaChatCompletionService(body, signal, presetName = '', connection = null) {
+    const service = connection ? null : getChatCompletionServiceOrNull();
+    if (!connection && !service) {
         return {
             result: null,
             error: new Error('ChatCompletionService is unavailable.'),
@@ -358,9 +369,14 @@ async function sendViaChatCompletionService(body, signal, presetName = '') {
         ...body,
         stream: !!oai_settings?.stream_openai,
     };
+    const connectionRequest = prepareConnectionProfileRequest(
+        connection, serviceBody, signal,
+    );
     let full;
     try {
-        if (normalizedPresetName && typeof service.processRequest === 'function') {
+        if (connectionRequest) {
+            full = await connectionRequest();
+        } else if (normalizedPresetName && typeof service.processRequest === 'function') {
             full = await service.processRequest(serviceBody, { presetName: normalizedPresetName }, false, signal);
         } else {
             if (normalizedPresetName && typeof service.processRequest !== 'function') {
@@ -405,6 +421,12 @@ async function sendViaChatCompletionService(body, signal, presetName = '') {
     } catch (error) {
         if (signal?.aborted) {
             throw error;
+        }
+        if (connectionRequest) {
+            // A direct retry would discard the connection profile's key,
+            // routing and preset, and can compound a provider rate limit.
+            // ST wraps connection-profile provider failures in a generic error.
+            throw error?.cause instanceof Error ? error.cause : error;
         }
         console.warn(`${MODULE_NAME}: ChatCompletionService request failed; falling back to STMB request path.`, error);
         return { result: null, error };
@@ -454,6 +476,15 @@ export async function sendRawCompletionRequest({
 }) {
     let url = getCurrentCompletionEndpoint();
     let headers = getRequestHeaders();
+    const connection = api !== 'full-manual' && useChatCompletionService
+        ? getSelectedConnectionProfile(getContext(), tr)
+        : null;
+    if (connection) {
+        api = connection.source;
+        model = model || connection.profile.model;
+        // The active ST profile owns its URL and secret, including for Custom.
+        connectionProfileId = null;
+    }
     const selectedCustomConnection = api === 'custom' && connectionProfileId
         ? resolveCustomConnectionProfile(
             extension_settings?.connectionManager?.profiles,
@@ -601,7 +632,7 @@ export async function sendRawCompletionRequest({
     let chatCompletionServiceError = null;
     if (api !== 'full-manual' && useChatCompletionService) {
         const routedFallbackBody = applyOpenRouterRoutingSettings(body, oai_settings);
-        const serviceAttempt = await sendViaChatCompletionService(body, signal, chatCompletionPreset);
+        const serviceAttempt = await sendViaChatCompletionService(body, signal, chatCompletionPreset, connection);
         if (serviceAttempt.result) {
             return serviceAttempt.result;
         }
@@ -1619,10 +1650,11 @@ async function buildPrompt(compiledScene, profile) {
         const useRegex = !!(extension_settings?.STMemoryBooks?.moduleSettings?.useRegex);
         const selectedKeys = extension_settings?.STMemoryBooks?.moduleSettings?.selectedRegexOutgoing;
         if (useRegex && Array.isArray(selectedKeys) && selectedKeys.length > 0) {
-            return applySelectedRegex(finalPrompt, selectedKeys);
+            return applySelectedRegex(finalPrompt, selectedKeys, { throwOnError: true });
         }
     } catch (e) {
         console.warn('STMemoryBooks: outgoing regex application failed', e);
+        throw e;
     }
     return finalPrompt;
 }

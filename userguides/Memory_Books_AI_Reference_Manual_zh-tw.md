@@ -413,9 +413,9 @@ Custom OpenAI-compatible 設定檔案可以：
 
 ### 7.6 ChatCompletionService
 
-**Use ST’s ChatCompletionService** 會把受支援的設定檔案請求經 SillyTavern 的 request helper 發送，並可應用所選的 SillyTavern Chat Completion preset。OpenRouter 請求還會繼承 SillyTavern 的 provider order、quantization filters、fallback controls 和 middle-out routing 設定。
+當 SillyTavern 的 Connection Manager 中選擇了 profile 時，**Use ST’s ChatCompletionService** 會使用 `ConnectionManagerRequestService`。該 connection profile 提供 provider、credentials、endpoint、proxy 與 Chat Completion preset。STMB 會覆寫 model 與 temperature，同時保留自己的 response-token limit 與 structured-output 選擇。Connection profile 的 preset 優先於在 STMB 中另外選擇的 Chat Completion preset。所選 connection profile 必須使用 Chat Completion。Connection-profile request 失敗時會直接回報，不會透過 STMB 的 direct request path 重試，因為那樣會失去 connection settings。
 
-如果 ChatCompletionService 失敗，而 STMB 通過 fallback request path 重試，這些 OpenRouter 控件仍然有效。如果 fallback 也失敗，STMB 會保留並報告最初的 ChatCompletionService 錯誤與後續 provider 響應。Full Manual 設定檔案不使用此路由。
+如果沒有選擇 SillyTavern connection profile，則沿用現有 ChatCompletionService 行為，包括 STMB 可選的 Chat Completion preset。透過此 route 的 OpenRouter request 也會繼承 SillyTavern 的 provider order、quantization filters、fallback controls 與 middle-out routing setting。如果 ChatCompletionService 失敗而 STMB 透過 fallback request path 重試，這些 controls 仍然有效。如果重試也失敗，STMB 會同時回報兩次失敗。取消勾選此選項會保留 STMB 的 direct request behavior。Full Manual profiles 不使用任一 service route。
 
 ### 7.7 Reverse proxy 與 Full Manual Configuration
 
@@ -660,7 +660,7 @@ Vectors 是可選項。沒有 Vectors 擴展，STMB 仍可通過 keywords 工作
 
 ### 11.1 定義
 
-Group Chat Mode 適用於由兩個或更多獨立角色卡組成的真實 SillyTavern 群組。
+Group Chat Mode 適用於真實的 SillyTavern group，其中包含兩個或更多獨立 character cards。
 
 ```text
 SillyTavern Group
@@ -669,9 +669,24 @@ SillyTavern Group
 └── Clara character card
 ```
 
-SillyTavern 會記錄每條訊息由哪張角色卡生成，因此 STMB 能保留說話者歸屬並檢測參與群成員。
+SillyTavern 會記錄每則 message 是由哪張 card 發送，因此 STMB 可以保留 speaker attribution，並偵測參與的 group members。
 
-不需要單獨開啓 Group Chat Mode 開關。打開群聊後正常使用 STMB 即可。
+不需要另外的 Group Chat Mode switch。開啟 group chat 後正常使用 STMB 即可。
+
+**General Settings → Group Chat** 包含兩個彼此獨立的 controls，預設都勾選：
+
+| Setting | Checked | Unchecked |
+|---|---|---|
+| **character-aware memories** | 啟用基於 participants 的 memory filters，以及已設定的 character-specific memory processing。 | 對新 memories、regeneration 與 consolidation 使用普通 single-book processing。不會進行 participant confirmation、character filters、character-book copies、linked regeneration、character-based consolidation streams 或 automatic group/character prompt routing。 |
+| **Use separate group side prompts** | Automatic side prompts 繼承 group default。 | Automatic side prompts 繼承 solo default。 |
+
+Memory checkbox 不影響 side-prompt checkbox。Side-prompt default routing 同時作用於 after-memory 與 interval triggers；明確的 per-chat set selection 或 individually enabled prompts 仍然優先，manual runs 仍可使用。
+
+當 character-aware memories 關閉時，**Automatically accept detected participants in future**、**Group Character Lorebooks** assignments、**Use separate group and character prompts in group chats** 以及其 **Group Summary Prompt / Character Summary Prompt** selectors 仍會顯示，但呈灰色。Tooltips 會說明，因為 General Settings checkbox 未勾選，所以這些項目被禁用且不會套用。當 separate group side prompts 關閉時，只有 group side-prompt default selector 會因此變灰。已儲存的 choices 會保留，並在重新啟用後恢復。
+
+這些 switches 不會遷移現有 entries 或 STLO configuration。現有 filters 會持續生效，直到 entry 被明確 regenerate；在 character-aware memories 關閉時 regeneration，會移除該 entry 的 character filter，但不會重寫 linked copies。新的 consolidated entries 不帶 filter，而 source entries 保留原 filters。已經開始的 operations，包括 queued jobs 與 retries，會繼續使用開始時 capture 的 settings。Native group identity、speaker names 與 primary Memory Book selection 都保持不變。Narrator Mode 與這些 native-group controls 彼此獨立。
+
+下文描述的 character-aware 行為只在 **character-aware memories** 勾選時適用。
 
 ### 11.2 參與者檢測
 
@@ -710,27 +725,26 @@ Alice 和 Bob 的 inclusive filter 意味著 Alice **或** Bob 活動時該條�
 
 ### 11.4 一本群組書 + 每角色獨立書
 
-高級真實群組佈局使用：
+進階 real-group layout 使用：
 
-- 一本 canonical group Memory Book；
-- 每個群成員各分配一本 character Memory Book。
+- 一個 canonical group Memory Book；
+- 為每個 group member 分配一個 character Memory Book。
 
 要求：
 
 - Manual Lorebook Mode；
-- 安裝並啓用 SillyTavern-LorebookOrdering (STLO)；
-- 每個必需群成員都有有效分配。
+- 每個必要的 group member 都有有效 assignment。
 
-canonical group book 不能同時當作 character book。多個角色可以共享同一本 character book；STMB 會向該共享書寫入一個 copy，而不是產生重復項。
+Canonical group book 也可以同時作為 character book。STMB 會在該 book 中把 canonical group entry 與 linked character copy 存為兩個獨立 entries。Character copy 會依 assigned character 設定 filter，並在該 character 的 turn 中優先於 canonical version。多個 characters 可以共用同一個 character book；STMB 會寫入一份 shared copy，而不是產生 duplicates。
 
 儲存 Memory 時：
 
 1. canonical version 寫入 group book；
-2. 除非開啓自動接受，否則確認 participants；
-3. linked copies 寫入選中參與者的書；
-4. 如果某個必要儲存失敗，STMB 會盡可能回滾部分寫入。
+2. 除非 automatic acceptance 已啟用，否則確認 participant selection；
+3. linked copies 寫入所選 participant books；
+4. 如果某個必要 save 失敗，STMB 會在可能時 rollback partial writes。
 
-真實群組 participant confirmation 中如果不選任何參與者，則這條 Memory 應用於當前所有群成員。
+在 real-group participant confirmation 中不選擇任何 participant，會把該 Memory 套用於目前所有 group members。
 
 ### 11.5 分開的 group 與 character prompts
 
@@ -751,25 +765,25 @@ Character-focused 版本可以保留：
 
 這會需要額外 AI 請求。共享 character book 只收到一個共享 copy，而不是按分配角色各重復一份。
 
-### 11.6 STLO 的職責
+### 11.6 可選 STLO 整合
 
 Memory Books 決定：
 
 - scene range；
 - participants；
 - summary content；
-- 哪些 books 收到 copies；
+- 哪些 books 接收 copies；
 - 是否使用 individualized prompts。
 
-STLO 決定：
+安裝 STLO 後，它還會決定：
 
-- 何時激活一本 lorebook；
-- 哪個角色可以激活它；
-- priority、position、budget 和 ordering。
+- lorebook 何時 active；
+- 哪個 character 可以 activate；
+- priority、position、budget 與 ordering。
 
-當 STMB 分配 character book 時，它會將角色 avatar basename 添加到 `stlo.characterOverrides` 並啓用 `stlo.onlyWhenSpeaking`，同時保留已有 STLO priorities、budgets 與 overrides。
+真實 group chat 不要求 STLO。STMB 會把目前發言 native group member 的 assigned book inject 到該次 generation 中，並使用 native entry-level character filters。如果 STLO 可用，而且 STMB 分配了獨立 character book，它還會把 character 的 avatar basename 加到 `stlo.characterOverrides` 並啟用 `stlo.onlyWhenSpeaking`，同時保留現有 STLO priorities、budgets 與 overrides。當 character assignment 就是 canonical group book 時，STMB 不會套用 lorebook-wide STLO speaking filter。
 
-STMB 使用 merge-only 行為。清除或更改分配不會自動刪除舊 STLO character override。過時 override 需要在 STLO 中手動移除。
+STMB 使用 merge-only behavior。清除或變更 assignment 不會自動刪除舊 STLO character override。請在 STLO 中手動移除過時 overrides。
 
 ### 11.7 Filters 與 books 不是隱私控制
 
@@ -841,30 +855,31 @@ Narrator Mode 不能在真實 SillyTavern 群聊中使用。
 Narrator Mode 要求：
 
 - Manual Lorebook Mode；
-- 一本已選擇的 **omniscient/canonical Memory Book**；
-- 每個聲明 cast member 各一本唯一 Memory Book。
+- 一個已選擇的 **omniscient/canonical Memory Book**；
+- 每個 declared cast member 都有一個唯一 Memory Book。
 
 規則：
 
 - cast member 不能使用 omniscient book；
-- 兩個 cast members 不能共享同一本 book；
-- 每個聲明成員都必須有可用 book；
-- retired members 會保留身份和保留的 book assignment，直到恢復或由實現用其他方式移除；
-- Auto-Create 不兼容，因為 Narrator Mode 依賴 Manual Lorebook Mode。
+- 兩個 cast members 不能共用同一個 book；
+- 每個 declared member 都必須有可用 book；
+- retired member 會保留 identity 與 reserved book assignment，直到恢復或由 implementation 以其他方式移除；
+- Auto-Create 不相容，因為 Narrator Mode 依賴 Manual Lorebook Mode。
 
-與高級真實群組佈局不同，Narrator Mode 的 active-character retrieval 不需要 STLO。STMB 會在生成期間把所選 cast members 的 books 注入 active lorebook context。
+與進階 real-group layout 一樣，Narrator Mode 的 active-character retrieval 不要求 STLO。STMB 會在 generation 時把所選 cast members 的 books inject 到 active lorebook context 中。
 
 ### 12.3 設定
 
-1. 打開 Narrator card 的普通聊天。
-2. 啓用 Manual Lorebook Mode。
+1. 開啟 Narrator card 的普通 chat。
+2. 啟用 Manual Lorebook Mode。
 3. 選擇 main manual book；它就是 omniscient Memory Book。
-4. 啓用 **Narrator Mode**。
-5. 打開 **Manage Narrator Cast**。
-6. 按名稱添加每個虛構角色，並給每人分配唯一 Memory Book。
-7. 使用浮動 **Active Cast** drawer 選擇下一段交流中出現的角色。
+4. 啟用 **Narrator Mode**。
+5. 開啟 **Manage Narrator Cast**。
+6. 按姓名加入每個 fictional character，並為其分配唯一 Memory Book。
+7. 使用已有 cast member 旁邊的 **Edit** 修正 character name 或變更該 member 的 assigned Memory Book。
+8. 使用浮動 **Active Cast** drawer 選擇下一次 exchange 中出現的 characters。
 
-必須先關閉 Narrator Mode，才能關閉 Manual Lorebook Mode。
+必須先禁用 Narrator Mode，才能禁用 Manual Lorebook Mode。
 
 ### 12.4 Active Cast drawer 與 timeline metadata
 
@@ -874,12 +889,14 @@ Narrator Mode 要求：
 
 - 使用者訊息收到 active-cast snapshot；
 - Narrator 回復收到 generation snapshot；
+- 完成的 Narrator 回應保留該快照，直到其訊息最終確定，即使產生首先結束；
 - continuation 會把其 cast 與已有 cast metadata 合併；
 - swipe metadata 為每個 swipe 單獨儲存；
 - 選擇 swipe 可以從該 timeline point 恢復 active cast；
 - 刪除最近訊息可以從剩餘最新帶標籤 Narrator message 恢復 cast state。
 
 cast marker 記錄關聯關係，不是對 prose 的語義分析。
+不會自動標記已停止或失敗的部分回應。如果場景包含一個，則遺留訊息演員確認仍然是必要的。
 
 ### 12.5 正常 Narrator 生成時的檢索
 
@@ -921,14 +938,16 @@ Regeneration 使用這些 metadata 判斷 replacement prompt target 應為 omnis
 
 ### 12.9 Retiring cast members
 
-cast manager 可以把 member 標為 retired，之後再恢復。Retired members：
+Cast manager 可以把 member 標記為 retired，並在之後恢復。Retired members：
 
-- 從 active-cast choices 移除；
-- 從 active-cast ID set 移除；
-- 保留穩定身份/歷史 metadata；
-- 保留 book reservation，防止意外復用並合併身份。
+- 從 active-cast choices 中移除；
+- 從 active-cast ID set 中移除；
+- 保留 stable identity/history metadata；
+- 保留其 book reservation，防止誤用導致 identities 混合。
 
-用於角色退出當前 cast，但其歷史 Memory identity 必須保留的情況。
+如果某個 character 離開 active cast，但其歷史 Memory identity 仍需保留，請使用 retirement。
+
+編輯 cast member 的 character name 或 Memory Book 不會改變該 member 的 stable identity 與 retired state。修正後的 name 會用於該 member 的所有顯示位置以及未來的 Memory output。新的 book assignment 控制未來 retrieval 與 Memory writes；它不會移動已經寫入舊 book 的 entries。
 
 ---
 
@@ -1057,9 +1076,11 @@ Topical Clip 按主題組織，而不是按每個 source Memory 的時間順序�
 Topical Clip 使用：
 
 - 所選 source book 中已經確認的 STMB Memory entries，包括符合條件的 consolidated summaries；
-- 當前聊天中明確選擇的 inclusive `X-Y` 範圍內可見 messages。
+- 來自目前聊天中明確選擇的 `X-Y` 範圍的訊息。僅當選取 **Also use hidden messages** 時才包含隱藏訊息。
 
-**Include saved Memories** 和 **Include chat messages** 可以單獨或一起使用。message ranges 遵循全局 unhide-before-memory 設定，並在編譯後恢復之前隱藏的 messages。
+**Include saved Memories** 和 **Include chat messages** 控制可以單獨或一起使用。 **Also use hidden messages**（位於 **Include chat messages** 正下方）控制訊息範圍和提取選擇是否包含隱藏訊息。它預設為未選取狀態並全域保存，在 **Unhide hidden messages for memory generation** 正下方的常規設定中提供相同的設定。 Topical Clip 讀取隱藏訊息而不改變其可見性，並且獨立於記憶體前取消隱藏設定。
+
+當Topical Clip視窗開啟時，**Start message ID**預設為所選場景開始，否則為最高處理的Memory訊息ID（`/stmb-highest`傳回的值），否則為`0`。 **End message ID**預設為選擇的scene-end，否則為目前最後一則訊息ID；它在空聊天中保持空白。訊息ID從0開始，直接使用最高的處理ID，不加1。這些預設值在視窗開啟時設定一次。您可以編輯它們，並且更改模式、目標或 Memory Books 會保留您的編輯。生成之前必須修正無效或顛倒的範圍。
 
 它不使用：
 
@@ -1077,7 +1098,7 @@ Topical Clip 使用：
 5. 輸入 activation keywords，或留空使用 topic。
 6. 選擇新 entry，或已有 `[STMB Clip]` update target。
 7. 選擇 saved Memories、chat messages 或兩者作為來源。
-8. 可選：只選擇特定 source Memories 和/或輸入精確 message range。
+8. 可選擇僅選擇特定來源 Memories。對於聊天訊息，輸入準確的範圍或點擊 **Extract…** 搜尋完整的目前聊天並選擇單一訊息，包括不連續的訊息。檢查 **Also use hidden messages** 以包含選定的隱藏訊息。
 9. 選擇 generation profile。
 10. 生成 draft。
 11. 審核並編輯。
@@ -1085,9 +1106,31 @@ Topical Clip 使用：
 
 生成 draft 永遠不會自動儲存。
 
+**Edit Topical Format** 控制已儲存條目的外部文字。其預設使用現有的 `=== title ===` 和 `=== END title ===` 邊框。此格式必須包含 `{{CONTENT}}` 一次； `{{TITLE}}` 是可選的。例如，`## {{TITLE}}` 後跟 `{{CONTENT}}` 保存 Markdown 標題，而單獨 `{{CONTENT}}` 則保存無邊框的正文。預覽顯示結果。重置可恢復內建格式。新的首選項會影響後續保存，而不影響現有條目。普通Clip附加保留條目上記錄的格式； Topical Clip 更新使用該剪輯類型的當前首選項。
+
+插入覆蓋可讓您選擇此儲存的位置和順序。選擇 **Outlet** 需要 **Outlet Name**。禁用的更新目標或普通 Clip 目標預設隱藏； **Show disabled clips**揭示了它。將更新儲存到已停用的 Topical Clip 即可啟用它。
+
+### 合併現有 Topical Clips
+
+在 **Topical Clip** 視窗中，按一下 **Combine Clips**。選擇一個 Memory Book，選擇至少兩個 Topical Clips（使用 **Show disabled clips** 包含已停用的剪輯），然後輸入新剪輯的標題。僅出現由STMB創建的Topical Clips；普通Clips除外。新剪輯的啟動關鍵字是所選剪輯的主要關鍵字的並集，沒有重複。不複製輔助關鍵字條件。
+
+選擇 generation profile 並點擊 **Generate Draft**。AI 會收到每個所選 clip 的 title 與完整 content，並被要求合併有依據的事實、移除重複內容，同時保留尚未解決的衝突。儲存前請 review 並編輯 draft。變更所選 sources、title 或 Memory Book 會清空 draft。如果某個 source 在儲存前發生變化，請重新生成 draft。
+
+**Edit Combine Clips Prompt**更改了AI合併指令。其模板需要 `{{SOURCE_CLIPS}}` 一次，並且可以使用 `{{TITLE}}`。 **Edit Combined Format** 獨立控制如何包裝保存的結果，使用與主題格式相同的 `{{CONTENT}}` 和可選的 `{{TITLE}}` 佔位符。兩個編輯器都提供重設為預設值。插入覆蓋包括位置、選擇插座時的插座名稱以及順序。
+
+**Disable original clips after saving** 預設勾選。取消勾選可保留原 clips 目前的 activation state。儲存會建立一個 enabled 的新 Topical Clip；如果該選項仍勾選，則會在同一次 Memory Book update 中 disable 原 clips。原 clips 永遠不會被刪除。合併後的 clip 會另外記錄 source IDs，與普通 Topical Clip 的 Memory-source history 分開。
+
+當 chat 中有文字被 highlight 時，浮動 control 會提供 **Clip** 與 **Extract**。Extract 會開啟同一個 message picker，並把反白文字作為 search query。它會搜尋目前 chat 的完整 history，包括目前沒有在畫面上 render 的 messages。空 search 會列出所有 messages。Search 會對 literal text 或 speaker names 做不區分大小寫的比對；**Hidden only** 會把結果限制為 hidden messages。
+
+結果以 50 個為批次顯示。使用 **Load more** 顯示更多匹配項，展開結果以閱讀突出顯示匹配項的完整文本，或使用 **Previous message** 和 **Next message** 顯示周圍的上下文。上下文訊息不會自動選擇，即使它們與搜尋或僅隱藏過濾器不匹配，也會顯示。隱藏的訊息被標記；只有在選取 **Also use hidden messages** 時，所選隱藏訊息才會包含在 Topical Clip 來源中，而不會在聊天中取消隱藏它們。
+
+選擇會在不同 search 與 filter 變化之間保留。Selection count 包括目前結果清單之外的 messages。**Select loaded results** 會選擇所有已顯示結果，包括顯示出的 context messages；**Clear selection** 會清除全部選擇。獨立使用 Extract 時選擇 **Topical Clip**；返回已有 editor 時選擇 **Use selected messages**。Query 會提供初始 topic 與 keywords，兩者都仍可編輯。
+
+STMB 會在 message 進入 picker 時記錄 source fingerprints，並在接受所選 messages、生成 draft 與儲存之前重新檢查。如果所選 source 已變化，**Refresh results** 會清除 selection 並重新載入結果，讓你重新選擇 sources。搜尋前請先完成或取消任何尚未結束的 message edit。切換 chat 會關閉 picker。Extract 不搜尋其他 chats。
+
 ### 15.4 更新已有 Topical Clip
 
-成功運行後，STMB 會記錄使用了哪些 source Memories；如果使用聊天訊息，還會記錄 source chat、message range、message IDs 與 hashes。以後基於 Memory 的更新通常只發送新增或已變化的 source Memories，並帶上現有 Clip 內容。message ranges 始終需要明確選擇。
+成功運行後，STMB 記錄使用了哪個來源 Memories，以及來源聊天（如果適用）、訊息範圍、訊息 ID 和雜湊值。稍後基於 Memory 的更新通常僅發送新的或更改的來源 Memories 以及現有的 Clip 內容。查看預先填入的訊息範圍或為每次運行輸入不同的範圍。
 
 以下情況使用 **Rebuild from all source memories**：
 
@@ -1203,14 +1246,15 @@ Side Prompt 可以啓用 **Run automatically after memory**。
 
 #### Memory Assistance Side Prompt
 
-**Memory Assistance** 是保留的 Side Prompt，有四種獨立模式。無論普通 Side Prompt enablement 或所選 Side Prompt Set 如何，只要 Memory 成功儲存，它都會在後面運行。Memory regeneration 時不運行。
+**Memory Assistance** 是一個保留的 Side Prompt，共有五種彼此獨立的 mode。成功儲存 Memory 後，無論普通 Side Prompt 是否啟用、目前選擇了哪個 Side Prompt Set，它都會執行。Memory regeneration 期間不會執行。
 
-Memory Assistance 會把原始 processed scene 與收到該 Memory 的每本 Memory Book 中的 ordinary 和 Topical Clips 比較。對每個被審核 Clip，它會發送 title/topic、keywords、current content、stable ID 與 type 給 AI。
+Memory Assistance 會把原始 processed scene 與收到該 Memory 的每本 Memory Book 中的 ordinary 和 Topical Clips 比較。對每個被審核 Clip，它會發送 title/topic、keywords、current content、stable ID 與 type 給 AI。 僅審查已啟用的 Clips。已停用的 Clips 將從 AI 查詢中排除，並從待處理建議中隱藏，而無需刪除已儲存的報告。
 
 有 job queue 時，每個 target Memory Book 都會在 Memory 儲存後獲得一個獨立 **Memory Assistance** job。request、response-validation、report-save 或 automatic-application error 會把該 job 標為 **Failed** 並在佇列中顯示錯誤。已儲存 Memory 仍是 **Completed**；重試 Memory Assistance 不會重新生成 Memory。
 
 - **Off**：關閉 Memory Assistance。
 - **Update**：五個或更少 Clips 直接審核；多於五個時打開選擇列表。建議變化等待手動批准。
+- **Suggest** 會發現新的 Topical Clip topics，但不會檢查或更新現有 Clips。
 - **Update and Suggest**：先做一次 topic-discovery request，再執行與 Update 相同的 existing-Clip review。
 - **Automatic**：按 token-based batches 審核所有 Clips，不詢問要審哪些。有效 ordinary Clip additions 直接應用，而 Topical Clip replacements 仍需在 **Memory Assistance Suggestions** 中批准。
 
@@ -1950,7 +1994,30 @@ Retry scopes：
 
 需要恢復完整組合 workflow 時使用 Retry All；不希望 tracker work 運行時使用 Retry Memory。
 
+Consolidation 儲存會在寫入每個已接受 summary 之前，先在 extension settings 中記錄一個 checkpoint。Summary 與用來 disable 其 sources 的變更會一起儲存。Retry 在寫入前會檢查 live Memory Book 中的 checkpoint marker，因此已確認的 summary 會被重用，而不是重複建立。Reload 之後，Extensions 選單中的 **Consolidation recovery** 會列出未完成 checkpoints，並提供 **Resume** 與 **Review details**。發生 source 變更、summary 被編輯、marker 重複或 save 未確認時，會標記為 **Needs Review**，且絕不會自動重播；檢查 Memory Book 後，可使用 **Dismiss after review** 移除 checkpoint 提示，而不修改 book。這使用 ST 的 settings 與 lorebook APIs，但並不提供 server transaction。
+
+Checkpoints 會把已接受的 summary draft、生成的 keywords、source IDs 與 fingerprints，以及 save options 保存在 ST extension settings 中，使 reload 後可以從完全相同的 candidate 繼續。請像保護 Memory Books 本身一樣保護 settings backups。
+
 沒有 Chat Top Bar 時，STMB 的正常 workflows 仍然可以運行，只是沒有 queue UI。
+
+
+### Deferred last-processed progress
+
+最後處理的標記記錄已被儲存的 Memory 覆蓋的最高聊天訊息。它提供用於後續Memory範圍和自動閾值計數的邊界；它不是配置的閾值本身。當來源聊天載入並空閒且驗證成功時，STMB 會自動更新並驗證標記。
+
+待處理的更新不僅限於切換聊天。當目前聊天正在產生回應、儲存或編輯訊息時，當來源訊息或標記驗證失敗時，或無法驗證自動標記儲存時，也可以延遲更新。當來源聊天開啟且空閒時，STMB 會自動重試仍通過驗證的掛起更新，驗證已儲存的標記，並清除已解析的記錄，而不會彈出視窗。重新開啟來源聊天也會觸發此復原。衝突或失敗的保存仍然會開啟恢復彈出視窗； STMB 在同一訪問期間不會重複重試失敗的恢復。丟棄保留現有標記，因此後續 Memories 可能會覆蓋已由已儲存的 Memory 匯總的訊息。
+
+如果 queued Memory 在其 source chat 已經不再開啟之後完成，該 Memory 仍會儲存到 Memory Book。STMB 不再取得並重寫 inactive character/group chat，而是把 last-processed marker update 記錄到 `extension_settings.STMemoryBooks.pendingProgress`。已經 queued 的 jobs 可以繼續完成；該 chat 新的 manual 與 automatic base-memory requests 會等待，直到 pending updates 被套用或明確 discarded。其他 chats 仍可正常使用。
+
+點擊待更新通知或主面板的 **Pending progress updates (N)** 按鈕將開啟管理彈出窗口，包括在刷新或停用聊天頂部欄之後。彈出視窗解釋了標記的作用以及為什麼保存的 Memories 在更新掛起時保持不變。另一次聊天，**Reopen chat and update marker** 切換到該角色或羣組聊天，並使用經過驗證的儲存路徑一鍵套用其掛起的更新。該檔案必須仍然存在，並且 STMB 在更新之前會檢查預期的聊天是否已載入。如果沒有此單擊，它不會切換聊天。如果重新開啟後驗證失敗，記錄仍可在目前活動的聊天中查看。
+
+對於活動聊天，**Apply** 仍然是明確手動覆蓋：它顯示 **Processing…**，在受影響的聊天中運行 `/stmb-set-highest <pending message number>`，並在顯示 **Done** 之前從設定中刪除待處理記錄。它使用命令的正常手動標記行為和範圍限制，而不比較訊息內容或附件或閱讀聊天內容。 **Later**、退出或關閉彈出視窗會保留記錄。 **Discard pending update** 需要確認並保持保存的知識簿記憶不變。
+
+每個 pending record 包含 chat reference、operation/job identity、target message index、original marker state/revision、chat integrity identifier，以及 source message text 與 identity fields 的 SHA-256 fingerprint。Attachment fields 不會讀取或 fingerprint。Conversation text 不會被持久化。追加 messages 與 hide/unhide changes 是允許的；edits、deletions、identity 變化、manual marker changes 或 rollback 可能使 update 不安全。這些檢查用於 automatic marker updates。Explicit Apply 即使在 original fingerprint 或 marker revision 已不相符時仍會使用 slash command；Later 保留 pending update，Discard 刪除它。明確的 chat/character rename events 會 remap pending references；missing 或 unrecognized references 仍保留供 review 與 discard。
+
+Pending records 使用 ST settings API 儲存，並透過重新讀取 settings 驗證，confirmation limit 為十秒。Settings failure 會讓 update 留在 memory 中。可以在 affected chat 中用 Apply 執行 marker command，或用 Discard pending update 移除 pending record。沒有單獨的 settings-save retry button。也沒有 browser recovery backup：在 settings 成功儲存前 refresh，可能遺失尚未 persisted 的 update。如果 Apply 後 settings cleanup 失敗，pending record 會保留；再次點擊 Apply 會重新執行 command 並重試 cleanup，而不會再生成一則 Memory。Explicit Apply 依賴 command 正常的 save behavior；automatic updates 仍會驗證 saved marker。
+
+這移除了 STMB 額外的 inactive-chat replacement write。ST 正常的 current-chat save 仍會寫入完整 chat，而來自其他 tabs/devices 的 concurrent settings saves 不具備 transaction 性。此變化並不能確定先前回報的 chat loss 原因，也不能保證防止所有 core/other-extension save races。
 
 ---
 
@@ -1994,10 +2061,10 @@ Accessibility 支援包括：
 |---|---|---|---|
 | **Enable Manual Lorebook Mode** | **Current Lorebook Configuration** | Global mode；book choice 為 per chat | 不再把正常 chat-bound lorebook 作為 STMB 自動 target，並要求為當前 chat 選擇 Memory Book。不能與 Auto-Create Lorebook Mode 同時啓用。 |
 | **Selected manual Memory Book** | **Current Lorebook Configuration → manual lorebook controls**；Manual Mode 下可見 | Per chat | 選擇本 chat 接收 Memories 的 main Memory Book。Narrator Mode 中這是 omniscient book。 |
-| **Group-character Memory Book assignments** | **Current Lorebook Configuration → group-character rows**；real group + Manual Mode 時可見 | Per chat | 為每個 real-group member 指定獨立 Memory Book。設定這些 assignments 以及對應 character-filtered retrieval behavior 需要 STLO。 |
+| **Group-character Memory Book assignments** | **Current Lorebook Configuration → group-character rows**；在使用 Manual Mode 的 real group 中顯示 | Per chat | 為每個 real-group member 分配 Memory Book。STMB 會 inject 目前 native speaker 的 assigned book；STLO integration 為可選。Canonical group book 也可以被分配，此時會同時儲存 group 與 character-focused entries。 |
 | **Character Memory Book lock** | character Memory Book assignment 旁的 lock icon | Per character | 讓該 character card 在兼容 Manual Mode chats 中始終使用同一個 Memory Book。更換 assignment 前必須 unlock。 |
 | **Narrator Mode** | **Current Lorebook Configuration**；只在普通 non-group chats | Per chat | 把選中的 manual book 作為 omniscient Memory Book，並啓用擁有各自 unique books 的 declared fictional cast。需要 Manual Mode 與 omniscient book。 |
-| **Manage Narrator Cast** | **Narrator Mode** 下；Active Cast drawer 中也可進入 | Per chat | 添加、retire、restore Narrator characters，並為其指定 unique Memory Books。 |
+| **Manage Narrator Cast** | 位於 **Narrator Mode** 下；也可從 Active Cast drawer 開啟 | Per chat | 新增、重新命名、retire、restore declared Narrator characters，並分配唯一 Memory Books。 |
 | **Auto-create lorebook if none exists** | **Current Lorebook Configuration** | Global | Automatic Mode 下，如果 chat 沒有 lorebook，則建立並綁定一個。不能與 Manual Mode 同時啓用。 |
 | **Lorebook Name Template** | **Auto-create lorebook if none exists** 下方 | Global | 命名 auto-created books。支援 `{{char}}`、`{{user}}`、`{{chat}}`。只在 Auto-Create Lorebook Mode 啓用時使用。 |
 | **Memory profile selection** | **Memory Profiles** selector | Per run | 為下一次 Memory 以及旁邊的 profile actions 選擇 profile。單純選擇並不會改變儲存的 default。 |
@@ -2020,7 +2087,8 @@ Accessibility 支援包括：
 | **Allow scene overlap** | Global | 允許 selected scene range 與已由 existing Memory 表示的 message IDs 重疊。 |
 | **Refresh lorebook editor after adding memories** | Global | STMB 寫入 entries 後重新整理已打開的 lorebook editor，以立即顯示新內容。 |
 | **Copy Memory Books when branching** | Global | native chat branch 獲得當前 active unlocked chat-bound 或 manual Memory Books 的獨立副本。Character-locked books 按設計繼續共享。 |
-| **Auto-rollback after message deletion** | Global | 當 message deletion 或 truncation 影響已經 processed 的 chat material 時啓用 coordinated rollback。預設關閉。一般 message edits 與 swipes 不會觸發。 |
+| **Auto-rollback after message deletion** | Global | 當刪除或 truncation 與已經處理過的 chat material 相交時，啟用 coordinated rollback。預設關閉。普通 message edit 與 swipe 不會觸發。 |
+| **Apply auto-rollback to branches/checkpoints** | Global；Auto-rollback option | 第一次開啟 branch 或 checkpoint 時，對超出其保留 messages 的 Memories 執行 rollback。要求每個 active Memory Book 都有獨立 copy；否則跳過 rollback。 |
 | **Update last message ID processed** | Global；Auto-Rollback action | 將 processed checkpoint 移到最新 surviving Memory 的結尾；如果沒有剩餘 Memory，則清除 checkpoint。 |
 | **Delete last Memory** | Global；Auto-Rollback action | 刪除 rollback scope 中所有 invalidated Memories 及其 linked copies。Memory 與 consolidation 的刪除不可逆。 |
 | **Restore previous Side Prompts** | Global；Auto-Rollback action | 將每個未另行變更的 affected Side Prompt 恢復到最新 exact before-state。只保留一個 rollback level。 |
@@ -2036,6 +2104,14 @@ Accessibility 支援包括：
 #### General Settings 中的 Memory Auto-Rollback
 
 **Auto-rollback after message deletion** 是 master preference。三個 action checkboxes 可以獨立選擇，預設 enabled；master switch 關閉時它們在界面中會顯示為 disabled。因此，既有安裝不會只因升級就開始刪除內容。
+
+**Apply auto-rollback to branches/checkpoints** 預設關閉。啟用後，STMB 會在第一次開啟符合條件的 branch 或 checkpoint 時套用所選 actions，包括已經存在的 child chats。Checkpoint 在開啟時處理，而不是建立時處理。STMB 使用 child chat 目前的 message count 作為第一個被省略 message 的 index，因此在最後一則保留 message 處結束的 Memory 會保持不變，而跨越或位於該 boundary 之後的 Memories 則可被 rollback。完成狀態會針對該 child 與 boundary 記錄下來；修改 settings 不會重複已經完成的 rollback。
+
+如果 branch/checkpoint rollback 刪除某個 Memory，在 Memory Books 成功儲存後，也會 unhide 該 Memory source range 中仍被保留的 messages。例如，在 message 36 處 branch，而某個 Memory 覆蓋 33–44，則會從 copy 中刪除該 Memory，並 unhide messages 33–36。這不依賴 unhide-before-generation preference。已經完成的 child rollback 在升級後不會自動重複；要修復已有 branch 中的這個範例，請使用 `/unhide 33-36`。
+
+Pending unhide ranges 會與 deletion 一起保存在同一批 Memory Book writes 中。如果切換 chat 或 error 中斷了 unhide，再次開啟啟用了 branch/checkpoint auto-rollback 的 child 時，會重試這些已儲存 ranges，即使被刪除的 Memories 已不存在。Retry 可能重複已經完成的 unhide commands；只有目標 chat 中每個 range 都完成後，recovery records 才會被移除。
+
+Branch/checkpoint rollback 要求每個 active Memory Book 都有 isolated copy。如果 **Copy Memory Books when branching** 被禁用，或者 shared/locked book 無法隔離，STMB 會跳過 rollback 並回報原因，以避免修改 parent chat 的資料。Copy/rollback failures 以及取消的 consolidation confirmations 在之後再次開啟時仍可繼續處理。
 
 Auto-Rollback 只回應 message deletion 或 truncation，也包括 response regeneration 的 deletion phase。一般 edit 或 swipe 不會觸發。由於 SillyTavern 的 deletion event value 無法可靠識別 middle deletion，STMB 會追蹤每個 chat 中實際的 message identities。
 
@@ -2062,6 +2138,7 @@ Side Prompt rollback 使用 version-2 regeneration snapshots。每個 snapshot �
 | **Auto-hide messages after adding memory** | Global | 選擇不自動隱藏、隱藏到 latest Memory 為止的所有 processed messages，或只隱藏 latest Memory 使用的 range。隱藏可逆，不會刪除 messages。 |
 | **Messages to leave unhidden** | Global | auto-hide 時保留這麼多 recent messages 可見，以在 Memory boundary 附近保留 overlap。`0` 會一直隱藏到適用 scene end。 |
 | **Unhide hidden messages for memory generation** | Global | 在 STMB 編譯 source range 前執行相當於 `/unhide X-Y` 的操作。成功儲存後，由選定 auto-hide mode 決定哪些內容再次隱藏。 |
+| **Also use hidden messages** | Global; Topical Clip | 在 Topical Clip 訊息範圍和 Extract 選取的訊息中包含隱藏訊息，不改變其隱藏狀態。預設不勾選；獨立於 **Unhide hidden messages for memory generation** 設定。 |
 
 ### 27.3 Automatic Memories 與 consolidation reminders
 
@@ -2070,10 +2147,23 @@ Side Prompt rollback 使用 version-2 regeneration snapshots。每個 snapshot �
 | Setting | Scope | 作用 |
 |---|---|---|
 | **Auto-create memory summaries** | Global | 啓用 automatic `/nextmemory`-style Memory creation。若沒有 processed baseline，當前 STMB 可以從 message 0 開始；仍建議先做一條 manual Memory，以驗證設定並選擇明確 starting boundary。 |
-| **Auto-Summary Interval** | Global | 設定 normal automatic cadence 每次包含多少 messages。 |
+| **Auto-Summary Trigger** | Global | 選擇 automatic Memory creation 是由 message count 還是 token count 觸發。 |
+| **Auto-Summary Token Threshold** | Global | 當 trigger 為 **Tokens** 時，設定觸發 automatic Memory creation 的 token count。 |
+| **Auto-Summary Interval** | Global | 當 trigger 為 **Messages** 時，設定普通 automatic cadence 包含多少則 messages。 |
 | **Auto-Summary Buffer** | Global | 從本來已滿足條件的 automatic range 中排除這麼多個最新 messages，使 generation 稍微落後於 live conversation。 |
 | **Prompt for consolidation when a tier is ready** | Global | monitored tier 達到已儲存 minimum eligible-source count 時顯示 yes/later prompt。絕不會靜默執行 consolidation。 |
 | **Auto-Consolidation Tiers** | Global | 選擇哪些 target tiers 被監控 readiness prompts。每個 tier 的 minimum 在 **Consolidate Memories** 中儲存。 |
+
+#### Memory reminder notifications
+
+Automatic-memory reminder controls 只顯示在 **Automatic Memories** 中。Manual-memory reminder controls 同時顯示在 **General Settings** 與 **Automatic Memories** 中，並使用同一組 global preferences。兩個 reminder toggle 預設都為 **off**，而且獨立於 **Show notifications** 運作。
+
+- **Turn on reminders for automatic memories** 在 **Auto-create memory summaries** 啟用期間生效。可設定的 interval X 預設是 **10 messages**。第一次 reminder 在 **Auto-Summary Interval + Auto-Summary Buffer + X** 則未處理 messages 時到期，之後每增加 X 則 message 重複一次。例如 interval 50、buffer 2、X = 10 時，會在 62 則未處理 messages 時第一次提醒，接著如果在對應 count 執行檢查，則在 72、82 等時再次提醒。
+- **Turn on reminders to make memories manually** 在 auto-create 禁用期間生效。可設定的 interval Y 預設是 **50 messages**。它會在 Y 則未處理 messages 時首次提醒，之後每增加 Y 則 message 再提醒。切換 auto-create 開關不會清除這兩個 preferences。
+
+Interval 只接受正整數，並以現有 last-processed Memory boundary 為基準統計 **chat messages**，包括 user 與 assistant messages。即使 generation 使用 token threshold，automatic reminders 仍按 message 數量運作。檢查會在 assistant reply 之後以及 memory processing 進入 idle 時執行；generation、pending progress 與明確的 auto-summary postponement 會抑制新的 reminder。延遲出現的 reminder 會從 notification 實際出現時的 count 開始計算 repeat interval。
+
+Reminder toast 帶 close button，並會一直顯示到被 dismiss。只要 reminder 仍可見，重複 reminder 不會堆疊。Notification checkpoints 按 chat 儲存，所以 reload 不會立刻重複已經傳送過的 reminder。Processed boundary 或 reminder configuration 變化會重設相關 schedule；刪除 messages 會重新基準化 repeat checkpoints。切換 chat、改變 boundary，或禁用/切換 active reminder mode 都會清除目前可見 reminder。這些 reminders 不會建立 Memories，也不會改變 automatic generation thresholds。
 
 ### 27.4 Profile editor
 
@@ -2085,8 +2175,8 @@ Side Prompt rollback 使用 version-2 regeneration snapshots。每個 snapshot �
 | **API/Provider** | 選擇 current SillyTavern routing、supported provider、Custom OpenAI-compatible connection 或 Full Manual Configuration。 |
 | **Use this connection profile** | 對 **Custom OpenAI-Compatible API**，使用當前 active SillyTavern Custom connection 或一個 named Custom connection。其儲存的 URL/secret 會被使用，而 STMB **Model** 仍是 model override。 |
 | **Skip structured output and use plain-text completion** | provider 拒絕 structured-output schema 時，不再發送該 schema。Selected prompt 仍必須讓 model 返回 STMB 要求的 valid JSON。 |
-| **Use ST's ChatCompletionService** | 通過 SillyTavern built-in Chat Completion request helper 路由 supported requests。Full Manual profiles 不可用。 |
-| **Chat Completion Preset** | 可選擇通過 ChatCompletionService 應用一個 SillyTavern Chat Completion preset。 |
+| **Use ST's ChatCompletionService** | 使用所選 ST Connection Manager profile，並由 STMB 覆寫 model 與 temperature。未選擇 connection profile 時，使用現有 ChatCompletionService route。Full Manual profiles 不可用。 |
+| **Chat Completion Preset** | 未選擇 ST Connection Manager profile 時，可選用 SillyTavern Chat Completion preset；否則由 connection profile 提供 preset。 |
 | **Model** | 提供該 profile 的 exact model ID。**Current SillyTavern Settings** 則讀取 SillyTavern 當前 active model。 |
 | **Temperature** | 設定該 profile 的 generation randomness。**Current SillyTavern Settings** 則讀取 SillyTavern 當前 temperature。 |
 | **Use reverse proxy** | 為 supported providers 傳遞 SillyTavern configured reverse-proxy details；Full Manual Configuration 中 secret field 標記為 proxy password。 |
@@ -2160,6 +2250,9 @@ Active SillyTavern provider、model、temperature、connection preset 與 revers
 |---|---|---|---|
 | **Generation Profile / Compaction Profile** | **Topical Clip → Generation Profile**，或 **Compaction → Compaction Profile** | Global shared default | 選擇 Topical Clip generation 與 Compaction 使用的 STMB profile。在任一界面改變它，都會改變兩個 workflows 共用的 selection。 |
 | **Topical Clip Prompt** | **Topical Clip → Edit Topical Clip Prompt** | Global | 儲存 custom Topical Clip prompt template。**Reset to Default** 返回當前 built-in prompt。儲存或 generation 前會驗證 required source macros。 |
+| **Topical Format** | **Topical Clip → Edit Topical Format** | Global | 設定新儲存的 Topical Clips 及後續更新的格式。必須包含 `{{CONTENT}}`；`{{TITLE}}` 可選。 |
+| **Combined Format** | **Combine Clips → Edit Combined Format** | Global |格式化新儲存的組合剪輯和以後的更新，與主題格式分開。 |
+| **Combine Clips Prompt** | **Combine Clips → Edit Combine Clips Prompt** | Global |定義組合指令。需要`{{SOURCE_CLIPS}}`； `{{TITLE}}` 是可選的。 |
 | **Compaction Prompt** | **Compaction → Edit Compaction Prompt** | Global | 儲存用於縮短 existing Memory、Clip 與 Side Prompt entries 的 custom prompt template。**Reset to Default** 返回當前 built-in prompt。必須包含 `{{ENTRY_CONTENT}}`。 |
 
 Memory Book、topic、keywords、source inclusion、source selection、message range、draft，以及 Compaction 選中的 entry 都是 per-run workflow choices，而不是 persistent settings。
@@ -2601,3 +2694,12 @@ Memory Books 是一個建立在 SillyTavern lorebooks 上的 external continuity
 - consolidation 減少舊細節但不抹去 continuity；
 - 使用者驗證 retrieval，而不是假設 saved 就等於 sent；
 - advanced multi-book routing 只在其精度值得額外複雜度時使用。
+### Side Prompt version history
+
+在 **Trackers & Side Prompts** 中啟用 **Enable sideprompt versioning**，然後在每個需要保留 history 的普通 Side Prompt 上啟用 **Save all versions**。兩個設定預設都為 off。Template setting 會在編輯、複製、匯入與匯出時保留；Memory Assistance 不支援 version history。
+
+每次成功 run 都會保存在 target lorebook 中，命名為 `Title-001 (STMB SidePrompt)`，接著是 `002` 與更高版本。第一次啟用 history 時，已有的未編號 output 會被採用為 `001`。舊版本會被 disabled，最新版本保持 enabled。各版本共用一個經過清理的 Side Prompt/chat inclusion group；改變 display name 後，會在後續一次成功儲存時更新該 group。Streams 按 template、chat、resolved title override 與 target lorebook 分開。
+
+如果任一設定被 disabled，STMB 會在原位置更新最新 output，同時保留已有 history。Regeneration 會更新所選 entry，而不是追加版本。Rollback 使用已有 snapshots，並在成功恢復後啟用最新 surviving version。Ambiguous legacy output 不會改變。Failed、blank、canceled 或 rejected run 不會建立 history。
+
+STMB 會在單一 browser tab 內序列化其參與的 lorebook writes。SillyTavern 現有的 concurrent-save 限制仍適用於其他 clients 與 direct editor saves。
